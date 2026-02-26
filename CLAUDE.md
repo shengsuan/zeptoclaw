@@ -21,7 +21,7 @@ cargo clippy -- -D warnings
 cargo fmt
 
 # Test counts (cargo test)
-# lib: 2398, main: 91, cli_smoke: 23, e2e: 13, integration: 70, doc: 147 (121 passed, 26 ignored)
+# lib: 2590, main: 92, cli_smoke: 23, e2e: 13, integration: 70, doc: 122 passed (27 ignored)
 
 # Version
 ./target/release/zeptoclaw --version
@@ -40,6 +40,13 @@ cargo fmt
 /model list
 /model reset
 /model <provider:model>
+
+# Telegram persona switching (in chat)
+/persona              # show current persona
+/persona list         # show available presets
+/persona concise      # switch to preset
+/persona Be a pirate  # set custom persona
+/persona reset        # clear per-chat override
 
 # Run gateway with container isolation
 ./target/release/zeptoclaw gateway --containerized          # auto-detect
@@ -147,6 +154,7 @@ Skip issue creation only for trivial changes (typo fixes, one-line tweaks).
 ### 3. Session End — Link and close
 
 - If creating a PR: include `Closes #N` in the PR body
+- Merge PRs with: `gh pr merge <number> --squash --delete-branch --admin`
 - If committing directly to main: close the issue with `gh issue close N --comment "Done in <commit-sha>"`
 - Update `CLAUDE.md` and `AGENTS.md` per the post-implementation checklist
 
@@ -186,12 +194,16 @@ src/
 │   ├── factory.rs  # Channel factory/registry
 │   ├── manager.rs  # Channel lifecycle management
 │   ├── model_switch.rs # /model command parsing + model registry + persistence
+│   ├── persona_switch.rs # /persona command parsing + preset registry + LTM persistence
 │   ├── telegram.rs # Telegram bot channel (HTML parse mode + ||spoiler|| support)
 │   ├── slack.rs    # Slack outbound channel
 │   ├── discord.rs  # Discord Gateway WebSocket + REST (reply + thread create)
 │   ├── webhook.rs  # Generic HTTP webhook inbound
 │   ├── whatsapp.rs # WhatsApp via whatsmeow-rs bridge (WebSocket)
-│   └── whatsapp_cloud.rs # WhatsApp Cloud API (official webhook + REST)
+│   ├── whatsapp_cloud.rs # WhatsApp Cloud API (official webhook + REST)
+│   ├── lark.rs     # Lark/Feishu messaging (WS long-connection)
+│   ├── email_channel.rs # Email channel (IMAP IDLE + SMTP)
+│   └── serial.rs  # Serial (UART) channel for embedded device messaging (feature: hardware)
 ├── cli/            # Clap command parsing + command handlers
 │   ├── memory.rs   # Memory list/search/set/delete/stats commands
 │   ├── tools.rs    # Tool discovery list/info + dynamic status summary
@@ -204,6 +216,7 @@ src/
 │   ├── fetcher.rs  # DepFetcher trait + real/mock implementations
 │   └── manager.rs  # DepManager lifecycle orchestrator
 ├── gateway/        # Containerized agent proxy (Docker/Apple)
+├── health.rs       # Health server, HealthRegistry, UsageMetrics, get_rss_bytes()
 ├── heartbeat/      # Periodic background task service
 ├── memory/         # Workspace memory + long-term memory with pluggable search backends
 │   ├── traits.rs         # MemorySearcher trait
@@ -212,17 +225,31 @@ src/
 │   ├── factory.rs        # create_searcher() factory from config
 │   ├── longterm.rs       # Persistent KV store with pluggable searcher
 │   └── mod.rs            # Workspace markdown search with pluggable searcher
+├── peripherals/    # Hardware peripherals (serial boards, GPIO, I2C, NVS)
+│   ├── traits.rs         # Peripheral trait (always compiled)
+│   ├── board_profile.rs  # BoardProfile registry — pin ranges, capabilities per board
+│   ├── serial.rs         # SerialTransport + SerialPeripheral + GPIO tools (feature: hardware)
+│   ├── i2c.rs            # I2C tools — scan, read, write (feature: hardware)
+│   ├── nvs.rs            # NVS tools — get, set, delete (feature: hardware)
+│   ├── esp32.rs          # ESP32 peripheral wrapper (feature: peripheral-esp32)
+│   ├── rpi.rs            # RPi GPIO peripheral + pin validation (feature: peripheral-rpi, Linux)
+│   ├── rpi_i2c.rs        # RPi native I2C tools — scan, read, write via rppal (feature: peripheral-rpi, Linux)
+│   ├── arduino.rs        # Arduino peripheral wrapper (feature: hardware)
+│   └── nucleo.rs         # STM32 Nucleo peripheral wrapper (feature: hardware)
 ├── providers/      # LLM providers (Claude, OpenAI, Retry, Fallback)
 ├── runtime/        # Container runtimes (Native, Docker, Apple)
 ├── routines/       # Event/webhook/cron triggered automations
-├── safety/         # Prompt injection detection, secret leak scanning, policy engine
+├── safety/         # Prompt injection detection, secret leak scanning, policy engine, chain alerting
 ├── security/       # Shell blocklist, path validation, mount policy, secret encryption
+│   ├── agent_mode.rs # Agent modes (Observer, Assistant, Autonomous) — category-based tool access
 │   └── encryption.rs # XChaCha20-Poly1305 + Argon2id secret encryption at rest
 ├── session/        # Session, message persistence, conversation history
 ├── tunnel/         # Tunnel providers (Cloudflare, ngrok, Tailscale)
+├── hooks/          # Config-driven hooks (before_tool, after_tool, on_error)
+├── migrate/        # OpenClaw migration (config, skills import)
 ├── skills/         # Markdown-based skill system (OpenClaw-compatible, loader, types)
 ├── plugins/        # Plugin system (JSON manifest, discovery, registry, binary mode)
-├── tools/          # Agent tools (18 tools + MCP + binary plugins + android)
+├── tools/          # Agent tools (29 built-in + MCP + binary plugins + android)
 │   ├── android/     # Android device control via ADB (feature-gated: --features android)
 │   │   ├── mod.rs      # AndroidTool struct, Tool trait impl, action dispatch
 │   │   ├── types.rs    # UIElement, ScreenState, StuckAlert
@@ -232,17 +259,30 @@ src/
 │   │   └── stuck.rs    # Screen hash, repetition/drift detection, alerts
 │   ├── binary_plugin.rs # Binary plugin adapter (JSON-RPC 2.0 stdin/stdout)
 │   ├── shell.rs       # Shell execution with runtime isolation
-│   ├── filesystem.rs  # Read, write, list, edit files
-│   ├── web.rs         # Web search (Brave) and fetch with SSRF protection
+│   ├── filesystem.rs  # Read, write, list, edit files (4 tools: read, write, list, edit)
+│   ├── web.rs         # Web search (Brave + DuckDuckGo fallback) and fetch with SSRF protection
+│   ├── git.rs         # Git operations (status, diff, log, commit)
+│   ├── stripe.rs      # Stripe API integration for payment operations
+│   ├── pdf_read.rs    # PDF text extraction (PdfReadTool)
+│   ├── transcribe.rs  # Audio transcription with provider abstraction
+│   ├── http_request.rs # General-purpose HTTP client tool
+│   ├── project.rs     # Project scaffolding and management
+│   ├── screenshot.rs  # Web screenshot capture (feature: screenshot)
+│   ├── custom.rs      # CLI-defined tools via custom_tools config
+│   ├── hardware.rs    # GPIO, serial, USB peripheral operations (feature: hardware)
 │   ├── whatsapp.rs    # WhatsApp Cloud API messaging
+│   ├── google.rs      # Google Workspace tool — Gmail + Calendar actions (feature: google)
 │   ├── gsheets.rs     # Google Sheets read/write
 │   ├── message.rs     # Proactive channel messaging (reply/thread hints)
-│   ├── memory.rs      # Workspace memory get/search
+│   ├── memory.rs      # Workspace memory get/search (2 tools)
 │   ├── longterm_memory.rs # Long-term memory tool (set/get/search/delete/list/categories/pin)
 │   ├── cron.rs        # Cron job scheduling
 │   ├── spawn.rs       # Background task delegation
-│   ├── delegate.rs    # Agent swarm delegation (DelegateTool)
+│   ├── delegate.rs    # Agent swarm delegation (DelegateTool) — parallel + sequential modes
+│   ├── composed.rs    # Natural language tool composition (CreateToolTool + ComposedTool)
 │   ├── plugin.rs      # Plugin tool adapter (PluginTool)
+│   ├── skills_install.rs # Skill installation tool
+│   ├── skills_search.rs  # Skill discovery/search tool
 │   ├── approval.rs    # Tool approval gate (ApprovalGate)
 │   ├── r8r.rs         # R8r workflow integration
 │   ├── reminder.rs    # Persistent reminders (add/complete/snooze/overdue) with cron delivery
@@ -288,6 +328,7 @@ LLM provider abstraction via `LLMProvider` trait:
 - `OpenAIProvider` - OpenAI Chat Completions API (120s timeout, SSE streaming); supports any OpenAI-compatible endpoint via `api_base` (Ollama, Groq, Together, Fireworks, LM Studio, vLLM)
 - `RetryProvider` - Decorator: exponential backoff on 429/5xx with structured `ProviderError` classification
 - `FallbackProvider` - Decorator: primary → secondary auto-failover with circuit breaker (Closed/Open/HalfOpen)
+- Per-provider model mapping: `ProviderConfig.model` overrides `agents.defaults.model` per provider; `FallbackProvider` swaps model on failover via `with_fallback_model()`
 - `ProviderError` enum: Auth, RateLimit, Billing, ServerError, InvalidRequest, ModelNotFound, Timeout — enables smart retry/fallback
 - Runtime provider assembly in `create_agent()`: resolves configured runtime providers in registry order, builds fallback chain only when `providers.fallback.enabled`, honors `providers.fallback.provider` as preferred first fallback, and optionally wraps the chain with `RetryProvider` (`providers.retry.*`)
 - `StreamEvent` enum + `chat_stream()` on LLMProvider trait for token-by-token streaming
@@ -304,8 +345,12 @@ Message input channels via `Channel` trait:
 - `WebhookChannel` - Generic HTTP POST inbound with optional Bearer auth
 - `WhatsAppChannel` - WhatsApp via whatsmeow-rs bridge (WebSocket JSON protocol)
 - `WhatsAppCloudChannel` - WhatsApp Cloud API (webhook inbound + REST outbound, no bridge)
+- `SerialChannel` - UART serial messaging (line-delimited JSON, feature: hardware)
 - CLI mode via direct agent invocation
 - All channels support `deny_by_default` config option for sender allowlists
+- Per-chat persona override via `/persona` command (mirrors `/model` pattern)
+- `PersonaOverrideStore` + LTM persistence for per-chat personas
+- First-chat detection: `FIRST_RUN_PERSONA_PROMPT` constant for prompting persona selection on first message
 - `ChannelManager` stores channel handles as `Arc<Mutex<_>>`, so outbound dispatch does not hold the channel map lock across async `send()`
 - `ChannelManager` supervision: polling supervisor (15s) detects dead channels via `is_running()`, restarts with 60s cooldown, max 5 restarts, reports to `HealthRegistry`
 - All spawned channel tasks set `running = false` on exit to prevent stale `is_running()` flags
@@ -318,7 +363,22 @@ Message input channels via `Channel` trait:
 - `DepFetcher` trait — abstracts network calls for testability
 
 ### Tools (`src/tools/`)
-18 built-in tools + dynamic MCP tools via `Tool` async trait. All filesystem tools require workspace.
+29 built-in tools + dynamic MCP tools + composed tools via `Tool` async trait. All filesystem tools require workspace.
+
+**Composed tools** (`src/tools/composed.rs`): Natural language tool composition.
+- `CreateToolTool` — agent tool with create/list/delete/run actions
+- `ComposedTool` — wraps a `ComposedToolDef`, interpolates `{{param}}` placeholders into action template, returns instructions for the agent to follow
+- `ComposedToolStore` — persistence at `~/.zeptoclaw/composed_tools.json`
+- Auto-loaded at startup in `create_agent()` as first-class tools
+
+**Delegate tool** (`src/tools/delegate.rs`): Multi-agent orchestration with parallel + sequential modes.
+- `DelegateTool` — `run` action delegates a single task to a sub-agent; `aggregate` action dispatches multiple tasks
+- `parallel: true` — concurrent fan-out via `futures::future::join_all`, bounded by semaphore (`config.swarm.max_concurrent`); no scratchpad context injection; partial results on per-agent errors
+- `parallel: false` (default) — sequential execution with `SwarmScratchpad` chaining (each sub-agent sees prior agents' outputs injected into system prompt)
+- Agent is instructed to ask the user which mode they prefer; respects explicit hints ("run in parallel", "one by one")
+- Recursion blocked: sub-agents cannot call `delegate` or `spawn`
+- `ProviderRef` wrapper shares `Arc<dyn LLMProvider>` across sub-agents without cloning
+- Config: `SwarmConfig` — `enabled` (default true), `max_depth` (1), `max_concurrent` (3), `roles` (HashMap of role presets with system prompts + tool whitelists)
 
 ### Utils (`src/utils/`)
 - `sanitize.rs` - Tool result sanitization (strip base64, hex, truncate)
@@ -341,6 +401,7 @@ Message input channels via `Channel` trait:
 - `TokenBudget` - Atomic per-session token budget tracker (lock-free via `AtomicU64`)
 - `ContextMonitor` - Token estimation (`words * 1.3 + 4/msg`), threshold-based compaction triggers
 - `Compactor` - Summarize (LLM-based) or Truncate strategies for context window management
+- `SwarmScratchpad` - Thread-safe `Arc<RwLock<HashMap>>` for agent-to-agent context passing; `format_for_prompt()` injects prior outputs into sub-agent system prompts (truncated at 2000 chars per entry)
 - `start()` now routes inbound work through `process_inbound_message()` helper and calls `try_queue_or_process()` before processing
 
 ### Memory (`src/memory/`)
@@ -349,10 +410,18 @@ Message input channels via `Channel` trait:
 - `Bm25Searcher` - Okapi BM25 keyword scorer (feature-gated: `memory-bm25`, zero deps)
 - `create_searcher()` - Factory maps `MemoryBackend` config to `Arc<dyn MemorySearcher>`
 - Workspace memory - Markdown search/read with pluggable searcher injection
-- `LongTermMemory` - Persistent key-value store at `~/.zeptoclaw/memory/longterm.json` with pluggable searcher, categories, tags, access tracking
+- `LongTermMemory` - Persistent key-value store at `~/.zeptoclaw/memory/longterm.json` with pluggable searcher, categories, tags, access tracking; injection guard on `set()` rejects values containing prompt injection patterns
 - `decay_score()` on `MemoryEntry` - 30-day half-life decay with importance weighting; pinned entries exempt (always 1.0)
 - `build_memory_injection()` - Pinned + query-matched memory injection for system prompt (2000 char budget)
 - Pre-compaction memory flush - Silent LLM turn saves important facts before context compaction (10s timeout)
+
+### Health (`src/health.rs`)
+- `HealthRegistry` — named component checks with restart count, last error
+- `UsageMetrics` — lock-free counters (requests, tool calls, tokens, errors)
+- `get_rss_bytes()` — platform RSS (macOS mach + Linux /proc/self/statm)
+- `/health` returns version, uptime, memory RSS, usage metrics, component checks
+- `/ready` returns boolean readiness (all checks not Down)
+- Raw TCP server — no web framework dependency
 
 ### Landing (`landing/zeptoclaw/index.html`)
 - Hero ambient animation, mascot eye/pupil motion, and magnetic CTA interactions
@@ -367,9 +436,11 @@ Message input channels via `Channel` trait:
 - `leak_detector.rs` - 22 regex patterns for API keys/tokens/secrets; Block, Redact, or Warn actions
 - `policy.rs` - 7 security policy rules (system file access, crypto keys, SQL, shell injection, encoded exploits)
 - `validator.rs` - Input length (100KB max), null byte, whitespace ratio, repetition detection
+- `chain_alert.rs` - Tool chain alerting: tracks tool call sequences per session, warns on dangerous patterns (write→execute, execute→fetch, memory→execute)
+- Tiered inbound injection scanning in agent loop: webhook channel blocked on injection, allowlisted channels (telegram, discord, etc.) warn-only
 
 ### Security (`src/security/`)
-- `shell.rs` - Regex-based command blocklist + optional allowlist (`ShellAllowlistMode`: Off/Warn/Strict)
+- `shell.rs` - Regex-based command blocklist + optional allowlist (`ShellAllowlistMode`: Off/Warn/Strict); includes `.zeptoclaw/config.json` blocklist to prevent LLM-driven config exfiltration
 - `path.rs` - Workspace path validation, symlink escape detection
 - `mount.rs` - Mount allowlist validation, docker binary verification
 - `encryption.rs` - `SecretEncryption`: XChaCha20-Poly1305 AEAD + Argon2id KDF, `ENC[...]` ciphertext format, `resolve_master_key()` for env/file/prompt sources, transparent config decrypt on load
@@ -407,8 +478,10 @@ Environment variables override config:
 - `ZEPTOCLAW_PROVIDERS_RETRY_MAX_RETRIES` — max retry attempts (default: 3)
 - `ZEPTOCLAW_PROVIDERS_RETRY_BASE_DELAY_MS` — base delay in ms (default: 1000)
 - `ZEPTOCLAW_PROVIDERS_RETRY_MAX_DELAY_MS` — max delay in ms (default: 30000)
+- `ZEPTOCLAW_PROVIDERS_RETRY_BUDGET_MS` — total wall-clock retry budget in ms, 0 = unlimited (default: 45000)
 - `ZEPTOCLAW_PROVIDERS_FALLBACK_ENABLED` — enable fallback provider (default: false)
 - `ZEPTOCLAW_PROVIDERS_FALLBACK_PROVIDER` — fallback provider name
+- `ZEPTOCLAW_PROVIDERS_<NAME>_MODEL` — per-provider model override (e.g. `ZEPTOCLAW_PROVIDERS_NVIDIA_MODEL=nvidia/llama-3.3-70b`); used instead of `agents.defaults.model` for this provider in fallback chains
 - `ZEPTOCLAW_AGENTS_DEFAULTS_TOKEN_BUDGET` — per-session token budget (default: 0 = unlimited)
 - `ZEPTOCLAW_SAFETY_ENABLED` — enable safety layer (default: true)
 - `ZEPTOCLAW_SAFETY_LEAK_DETECTION_ENABLED` — enable secret leak detection (default: true)
@@ -429,22 +502,11 @@ Environment variables override config:
 
 ### Cargo Features
 
-```bash
-# Default build (builtin memory searcher only)
-cargo build --release
-
-# With BM25 keyword scoring
-cargo build --release --features memory-bm25
-
-# Future features (not yet implemented)
-# cargo build --release --features memory-embedding
-# cargo build --release --features memory-hnsw
-# cargo build --release --features memory-tantivy
-```
-
-### Cargo Features
-
 - `android` — Enable Android device control tool (adds `quick-xml` dependency)
+- `google` — Enable Google Workspace tools (Gmail + Calendar) via gogcli-rs
+- `memory-bm25` — Enable BM25 keyword scoring for memory search
+- `peripheral-esp32` — Enable ESP32 peripheral with I2C + NVS tools (implies `hardware`)
+- `peripheral-rpi` — Enable Raspberry Pi GPIO + native I2C tools via rppal (Linux only)
 - `sandbox-landlock` — Enable Landlock LSM runtime (Linux only, adds `landlock` crate)
 - `sandbox-firejail` — Enable Firejail runtime (Linux only, requires `firejail` binary)
 - `sandbox-bubblewrap` — Enable Bubblewrap runtime (Linux only, requires `bwrap` binary)
@@ -489,7 +551,7 @@ cargo build --release
 ## Testing
 
 ```bash
-# Unit tests (2398 tests)
+# Unit tests (2590 tests)
 cargo test --lib
 
 # Main binary tests (91 tests)
@@ -504,7 +566,7 @@ cargo test --test e2e
 # Integration tests (70 tests)
 cargo test --test integration
 
-# All tests (~2,716 total including doc tests)
+# All tests (~2,748 total including doc tests)
 cargo test
 
 # Specific test

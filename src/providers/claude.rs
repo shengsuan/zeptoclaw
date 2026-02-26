@@ -191,6 +191,7 @@ impl LLMProvider for ClaudeProvider {
             .headers(self.auth_headers())
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
+            .header("X-Title", "ZeptoClaw")
             .json(&request)
             .send()
             .await?;
@@ -259,6 +260,7 @@ impl LLMProvider for ClaudeProvider {
             .headers(self.auth_headers())
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
+            .header("X-Title", "ZeptoClaw")
             .json(&request)
             .send()
             .await?;

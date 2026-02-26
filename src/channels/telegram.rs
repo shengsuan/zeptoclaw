@@ -61,6 +61,7 @@ use super::model_switch::{
     format_current_model, format_model_list, hydrate_overrides, new_override_store,
     parse_model_command, persist_single, remove_single, ModelCommand, ModelOverrideStore,
 };
+use super::persona_switch::{self, PersonaCommand, PersonaOverrideStore};
 use super::{BaseChannelConfig, Channel};
 
 /// Newtype wrappers to disambiguate `Vec<String>` / `String` in dptree's
@@ -72,6 +73,13 @@ struct Allowlist(Vec<String>);
 struct DefaultModel(String);
 #[derive(Clone)]
 struct ConfiguredProviders(Vec<String>);
+/// Bundles both override stores into one DI dependency so that dptree's
+/// 9-parameter arity limit is not exceeded.
+#[derive(Clone)]
+struct OverridesDep {
+    model: ModelOverrideStore,
+    persona: PersonaOverrideStore,
+}
 
 fn render_telegram_html(content: &str) -> String {
     let mut out = String::with_capacity(content.len() + 16);
@@ -135,6 +143,8 @@ pub struct TelegramChannel {
     bot: Option<teloxide::Bot>,
     /// Per-chat model overrides (in-memory)
     model_overrides: ModelOverrideStore,
+    /// Per-chat persona overrides (in-memory)
+    persona_overrides: PersonaOverrideStore,
     /// Default model name for /model status output
     default_model: String,
     /// Configured providers (for /model list)
@@ -207,6 +217,7 @@ impl TelegramChannel {
             shutdown_tx: None,
             bot: None,
             model_overrides: new_override_store(),
+            persona_overrides: persona_switch::new_persona_store(),
             default_model,
             configured_providers,
             longterm_memory,
@@ -295,7 +306,10 @@ impl Channel for TelegramChannel {
         let bus = self.bus.clone();
         let allowlist = Allowlist(self.config.allow_from.clone());
         let deny_by_default = self.config.deny_by_default;
-        let model_overrides = self.model_overrides.clone();
+        let overrides_dep = OverridesDep {
+            model: self.model_overrides.clone(),
+            persona: self.persona_overrides.clone(),
+        };
         let default_model = DefaultModel(self.default_model.clone());
         let configured_providers = ConfiguredProviders(self.configured_providers.clone());
         let longterm_memory = self.longterm_memory.clone();
@@ -315,6 +329,9 @@ impl Channel for TelegramChannel {
 
         if let Some(ltm) = self.longterm_memory.as_ref() {
             hydrate_overrides(&self.model_overrides, ltm).await;
+        }
+        if let Some(ltm) = self.longterm_memory.as_ref() {
+            persona_switch::hydrate_overrides(&self.persona_overrides, ltm).await;
         }
 
         // Spawn the bot polling task
@@ -350,7 +367,7 @@ impl Channel for TelegramChannel {
                             }
 
                             let delay = if let RequestError::RetryAfter(d) = &e {
-                                *d
+                                d.duration()
                             } else {
                                 TelegramChannel::startup_backoff_delay(attempt)
                             };
@@ -382,12 +399,14 @@ impl Channel for TelegramChannel {
                          bus: Arc<MessageBus>,
                          Allowlist(allowlist): Allowlist,
                          deny_by_default: bool,
-                         model_overrides: ModelOverrideStore,
+                         overrides_dep: OverridesDep,
                          DefaultModel(default_model): DefaultModel,
                          ConfiguredProviders(configured_providers): ConfiguredProviders,
                          longterm_memory: Option<Arc<Mutex<LongTermMemory>>>| async move {
+                            let model_overrides = overrides_dep.model;
+                            let persona_overrides = overrides_dep.persona;
                             // Extract user ID and optional username
-                            let user = msg.from();
+                            let user = msg.from.as_ref();
                             let user_id = user
                                 .map(|u| u.id.0.to_string())
                                 .unwrap_or_else(|| "unknown".to_string());
@@ -433,12 +452,48 @@ impl Channel for TelegramChannel {
                                 let chat_id = msg.chat.id.0.to_string();
                                 let chat_id_num = msg.chat.id.0;
 
+                                // Extract forum topic thread ID for topic-aware routing.
+                                // In teloxide 0.13, Message::thread_id is Option<ThreadId>
+                                // where ThreadId wraps MessageId which wraps i32.
+                                let thread_id: Option<String> =
+                                    msg.thread_id.map(|t| t.0 .0.to_string());
+
+                                // Build a topic-aware override key. When a topic thread
+                                // is present, model/persona overrides are scoped per-topic
+                                // so each forum topic can have its own model/persona.
+                                let override_key = if let Some(ref tid) = thread_id {
+                                    format!("{}:{}", chat_id, tid)
+                                } else {
+                                    chat_id.clone()
+                                };
+
                                 info!(
                                     "Telegram: Received message from user {} in chat {}: {}",
                                     user_id,
                                     chat_id,
                                     crate::utils::string::preview(text, 50)
                                 );
+
+                                /// Helper to attach message_thread_id to a SendMessage request.
+                                fn apply_thread_id(
+                                    req: teloxide::requests::JsonRequest<
+                                        teloxide::payloads::SendMessage,
+                                    >,
+                                    thread_id: &Option<String>,
+                                ) -> teloxide::requests::JsonRequest<
+                                    teloxide::payloads::SendMessage,
+                                > {
+                                    if let Some(ref tid) = thread_id {
+                                        if let Ok(id) = tid.parse::<i32>() {
+                                            return req.message_thread_id(
+                                                teloxide::types::ThreadId(
+                                                    teloxide::types::MessageId(id),
+                                                ),
+                                            );
+                                        }
+                                    }
+                                    req
+                                }
 
                                 // Intercept /model commands
                                 // TODO(#63): Migrate to CommandInterceptor (Approach B) when adding /model
@@ -448,16 +503,16 @@ impl Channel for TelegramChannel {
                                         ModelCommand::Show => {
                                             let current = {
                                                 let overrides = model_overrides.read().await;
-                                                overrides.get(&chat_id).cloned()
+                                                overrides.get(&override_key).cloned()
                                             };
                                             let reply =
                                                 format_current_model(current.as_ref(), &default_model);
-                                            let _ = bot
+                                            let req = bot
                                                 .send_message(
                                                     teloxide::types::ChatId(chat_id_num),
                                                     reply,
-                                                )
-                                                .await;
+                                                );
+                                            let _ = apply_thread_id(req, &thread_id).await;
                                         }
                                         ModelCommand::Set(ov) => {
                                             let reply = format!(
@@ -467,49 +522,132 @@ impl Channel for TelegramChannel {
                                             );
                                             {
                                                 let mut overrides = model_overrides.write().await;
-                                                overrides.insert(chat_id.clone(), ov.clone());
+                                                overrides.insert(override_key.clone(), ov.clone());
                                             }
                                             if let Some(ref ltm) = longterm_memory {
-                                                persist_single(&chat_id, &ov, ltm).await;
+                                                persist_single(&override_key, &ov, ltm).await;
                                             }
-                                            let _ = bot
+                                            let req = bot
                                                 .send_message(
                                                     teloxide::types::ChatId(chat_id_num),
                                                     reply,
-                                                )
-                                                .await;
+                                                );
+                                            let _ = apply_thread_id(req, &thread_id).await;
                                         }
                                         ModelCommand::Reset => {
                                             {
                                                 let mut overrides = model_overrides.write().await;
-                                                overrides.remove(&chat_id);
+                                                overrides.remove(&override_key);
                                             }
                                             if let Some(ref ltm) = longterm_memory {
-                                                remove_single(&chat_id, ltm).await;
+                                                remove_single(&override_key, ltm).await;
                                             }
                                             let reply = format!("Reset to default: {}", default_model);
-                                            let _ = bot
+                                            let req = bot
                                                 .send_message(
                                                     teloxide::types::ChatId(chat_id_num),
                                                     reply,
-                                                )
-                                                .await;
+                                                );
+                                            let _ = apply_thread_id(req, &thread_id).await;
                                         }
                                         ModelCommand::List => {
                                             let current = {
                                                 let overrides = model_overrides.read().await;
-                                                overrides.get(&chat_id).cloned()
+                                                overrides.get(&override_key).cloned()
                                             };
                                             let reply = format_model_list(
                                                 &configured_providers,
                                                 current.as_ref(),
                                             );
-                                            let _ = bot
+                                            let req = bot
                                                 .send_message(
                                                     teloxide::types::ChatId(chat_id_num),
                                                     reply,
+                                                );
+                                            let _ = apply_thread_id(req, &thread_id).await;
+                                        }
+                                    }
+                                    return Ok(());
+                                }
+
+                                // Intercept /persona commands
+                                if let Some(cmd) = persona_switch::parse_persona_command(text) {
+                                    match cmd {
+                                        PersonaCommand::Show => {
+                                            let current = {
+                                                let overrides = persona_overrides.read().await;
+                                                overrides.get(&override_key).cloned()
+                                            };
+                                            let reply = persona_switch::format_current_persona(
+                                                current.as_deref(),
+                                            );
+                                            let req = bot
+                                                .send_message(
+                                                    teloxide::types::ChatId(chat_id_num),
+                                                    reply,
+                                                );
+                                            let _ = apply_thread_id(req, &thread_id).await;
+                                        }
+                                        PersonaCommand::Set(value) => {
+                                            let resolved =
+                                                persona_switch::resolve_soul_content(&value);
+                                            let reply = if resolved.is_empty() {
+                                                "Switched to default persona".to_string()
+                                            } else {
+                                                format!("Switched to persona: {}", value)
+                                            };
+                                            {
+                                                let mut overrides =
+                                                    persona_overrides.write().await;
+                                                overrides
+                                                    .insert(override_key.clone(), value.clone());
+                                            }
+                                            if let Some(ref ltm) = longterm_memory {
+                                                persona_switch::persist_single(
+                                                    &override_key, &value, ltm,
                                                 )
                                                 .await;
+                                            }
+                                            let req = bot
+                                                .send_message(
+                                                    teloxide::types::ChatId(chat_id_num),
+                                                    reply,
+                                                );
+                                            let _ = apply_thread_id(req, &thread_id).await;
+                                        }
+                                        PersonaCommand::Reset => {
+                                            {
+                                                let mut overrides =
+                                                    persona_overrides.write().await;
+                                                overrides.remove(&override_key);
+                                            }
+                                            if let Some(ref ltm) = longterm_memory {
+                                                persona_switch::remove_single(&override_key, ltm)
+                                                    .await;
+                                            }
+                                            let reply =
+                                                "Persona reset to default".to_string();
+                                            let req = bot
+                                                .send_message(
+                                                    teloxide::types::ChatId(chat_id_num),
+                                                    reply,
+                                                );
+                                            let _ = apply_thread_id(req, &thread_id).await;
+                                        }
+                                        PersonaCommand::List => {
+                                            let current = {
+                                                let overrides = persona_overrides.read().await;
+                                                overrides.get(&override_key).cloned()
+                                            };
+                                            let reply = persona_switch::format_persona_list(
+                                                current.as_deref(),
+                                            );
+                                            let req = bot
+                                                .send_message(
+                                                    teloxide::types::ChatId(chat_id_num),
+                                                    reply,
+                                                );
+                                            let _ = apply_thread_id(req, &thread_id).await;
                                         }
                                     }
                                     return Ok(());
@@ -518,9 +656,20 @@ impl Channel for TelegramChannel {
                                 // Create and publish the inbound message
                                 let mut inbound =
                                     InboundMessage::new("telegram", &user_id, &chat_id, text);
+
+                                // For forum topics, override session key to isolate
+                                // per-topic conversations and attach thread metadata
+                                // so outbound replies route to the correct topic.
+                                if let Some(ref tid) = thread_id {
+                                    inbound.session_key =
+                                        format!("telegram:{}:{}", chat_id, tid);
+                                    inbound =
+                                        inbound.with_metadata("telegram_thread_id", tid);
+                                }
+
                                 let override_entry = {
                                     let overrides = model_overrides.read().await;
-                                    overrides.get(&chat_id).cloned()
+                                    overrides.get(&override_key).cloned()
                                 };
                                 if let Some(ov) = override_entry {
                                     inbound = inbound.with_metadata("model_override", &ov.model);
@@ -528,6 +677,15 @@ impl Channel for TelegramChannel {
                                         inbound =
                                             inbound.with_metadata("provider_override", &provider);
                                     }
+                                }
+
+                                let persona_entry = {
+                                    let overrides = persona_overrides.read().await;
+                                    overrides.get(&override_key).cloned()
+                                };
+                                if let Some(persona_value) = persona_entry {
+                                    inbound = inbound
+                                        .with_metadata("persona_override", &persona_value);
                                 }
 
                                 if let Err(e) = bus.publish_inbound(inbound).await {
@@ -546,7 +704,7 @@ impl Channel for TelegramChannel {
                         bus,
                         allowlist,
                         deny_by_default,
-                        model_overrides,
+                        overrides_dep,
                         default_model,
                         configured_providers,
                         longterm_memory
@@ -641,9 +799,19 @@ impl Channel for TelegramChannel {
             .ok_or_else(|| ZeptoError::Channel("Telegram bot not initialized".to_string()))?;
 
         let rendered = render_telegram_html(&msg.content);
-        bot.send_message(ChatId(chat_id), rendered)
-            .parse_mode(ParseMode::Html)
-            .await
+        let mut req = bot
+            .send_message(ChatId(chat_id), rendered)
+            .parse_mode(ParseMode::Html);
+
+        // Route reply to the correct forum topic when thread metadata is present.
+        if let Some(thread_id_str) = msg.metadata.get("telegram_thread_id") {
+            if let Ok(tid) = thread_id_str.parse::<i32>() {
+                req = req
+                    .message_thread_id(teloxide::types::ThreadId(teloxide::types::MessageId(tid)));
+            }
+        }
+
+        req.await
             .map_err(|e| ZeptoError::Channel(format!("Failed to send Telegram message: {}", e)))?;
 
         info!("Telegram: Message sent successfully to chat {}", chat_id);
@@ -883,5 +1051,62 @@ mod tests {
     fn test_startup_backoff_delay_no_overflow() {
         let d = TelegramChannel::startup_backoff_delay(u32::MAX);
         assert_eq!(d, Duration::from_secs(MAX_RETRY_DELAY_SECS));
+    }
+
+    // -----------------------------------------------------------------------
+    // Forum Topics (thread_id) support
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_thread_id_override_key() {
+        // Override key includes thread_id when present (per-topic model/persona).
+        let chat_id = "12345";
+        let thread_id: Option<String> = Some("99".to_string());
+        let override_key = if let Some(ref tid) = thread_id {
+            format!("{}:{}", chat_id, tid)
+        } else {
+            chat_id.to_string()
+        };
+        assert_eq!(override_key, "12345:99");
+    }
+
+    #[test]
+    fn test_thread_id_override_key_no_thread() {
+        // Override key falls back to plain chat_id when no thread is present.
+        let chat_id = "12345";
+        let thread_id: Option<String> = None;
+        let override_key = if let Some(ref tid) = thread_id {
+            format!("{}:{}", chat_id, tid)
+        } else {
+            chat_id.to_string()
+        };
+        assert_eq!(override_key, "12345");
+    }
+
+    #[test]
+    fn test_inbound_message_with_thread_id() {
+        use crate::bus::InboundMessage;
+        let mut inbound = InboundMessage::new("telegram", "user1", "chat1", "Hello");
+        let thread_id = Some("42".to_string());
+        if let Some(ref tid) = thread_id {
+            inbound.session_key = format!("telegram:{}:{}", "chat1", tid);
+            inbound = inbound.with_metadata("telegram_thread_id", tid);
+        }
+        assert_eq!(inbound.session_key, "telegram:chat1:42");
+        assert_eq!(
+            inbound.metadata.get("telegram_thread_id"),
+            Some(&"42".to_string())
+        );
+    }
+
+    #[test]
+    fn test_outbound_with_thread_metadata() {
+        use crate::bus::OutboundMessage;
+        let msg = OutboundMessage::new("telegram", "chat1", "Reply")
+            .with_metadata("telegram_thread_id", "42");
+        assert_eq!(
+            msg.metadata.get("telegram_thread_id"),
+            Some(&"42".to_string())
+        );
     }
 }

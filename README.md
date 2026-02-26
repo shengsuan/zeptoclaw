@@ -31,13 +31,13 @@ $ zeptoclaw agent --stream -m "Analyze our API for security issues"
 ✓ Analysis complete in 4.2s
 ```
 
-We studied the best AI assistants — and their tradeoffs. OpenClaw's integrations without the 100MB. NanoClaw's security without the TypeScript bundle. PicoClaw's size without the bare-bones feature set. One Rust binary with 29 tools, 8 channels, 9 providers, and container isolation.
+We studied the best AI assistants — and their tradeoffs. OpenClaw's integrations without the 100MB. NanoClaw's security without the TypeScript bundle. PicoClaw's size without the bare-bones feature set. One Rust binary with 29 tools, 9 channels, 9 providers, and 6 sandbox runtimes.
 
 <p align="center">
   <img src="https://img.shields.io/badge/binary-~4MB-3b82f6" alt="~4MB binary">
   <img src="https://img.shields.io/badge/startup-~50ms-3b82f6" alt="~50ms startup">
   <img src="https://img.shields.io/badge/RAM-~6MB-3b82f6" alt="~6MB RAM">
-  <img src="https://img.shields.io/badge/tests-2%2C300%2B-3b82f6" alt="2,300+ tests">
+  <img src="https://img.shields.io/badge/tests-2%2C880%2B-3b82f6" alt="2,880+ tests">
   <img src="https://img.shields.io/badge/providers-9-3b82f6" alt="9 providers">
 </p>
 
@@ -57,13 +57,14 @@ The OpenClaw ecosystem has seen CVE-2026-25253 (CVSS 8.8 — cross-site WebSocke
 
 | Layer | What it does |
 |-------|-------------|
-| **Container Isolation** | Every shell command runs in Docker or Apple Container — not on your host |
+| **6 Sandbox Runtimes** | Docker, Apple Container, Landlock, Firejail, Bubblewrap, or native — per request |
 | **Prompt Injection Detection** | Aho-Corasick multi-pattern matcher (17 patterns) + 4 regex rules |
 | **Secret Leak Scanner** | 22 regex patterns catch API keys, tokens, and credentials before they reach the LLM |
 | **Policy Engine** | 7 rules blocking system file access, crypto key extraction, SQL injection, encoded exploits |
 | **Input Validator** | 100KB limit, null byte detection, whitespace ratio analysis, repetition detection |
 | **Shell Blocklist** | Regex patterns blocking reverse shells, `rm -rf`, privilege escalation |
-| **SSRF Prevention** | DNS pinning, private IP blocking, scheme validation for all web requests |
+| **SSRF Prevention** | DNS pinning, private IP blocking, IPv6 transition guard, scheme validation |
+| **Chain Alerting** | Detects dangerous tool call sequences (write→execute, memory→execute) |
 | **Tool Approval Gate** | Require explicit confirmation before executing dangerous tools |
 
 Every layer runs by default. No flags to remember, no config to enable.
@@ -193,9 +194,11 @@ Any provider's base URL can be overridden with `api_base` for proxies or self-ho
 
 | Feature | What it does |
 |---------|-------------|
-| **Multi-Provider LLM** | 9 providers with SSE streaming, retry with backoff, auto-failover |
+| **Multi-Provider LLM** | 9 providers with SSE streaming, retry with backoff + budget cap, auto-failover |
 | **29 Tools + Plugins** | Shell, filesystem, web, git, stripe, PDF, transcription, Android ADB, and more |
-| **Agent Swarms** | Delegate to sub-agents with parallel dispatch, aggregation, and cost-aware routing |
+| **Tool Composition** | Create new tools from natural language descriptions — composable `{{param}}` templates |
+| **Agent Swarms** | Delegate to sub-agents with parallel fan-out, aggregation, and cost-aware routing |
+| **Library Facade** | Embed as a crate — `ZeptoAgent::builder().provider(p).tool(t).build()` for Tauri/GUI apps |
 | **Batch Mode** | Process hundreds of prompts from text/JSONL files with template support |
 | **Agent Modes** | Observer, Assistant, Autonomous — category-based tool access control |
 
@@ -203,7 +206,8 @@ Any provider's base URL can be overridden with `api_base` for proxies or self-ho
 
 | Feature | What it does |
 |---------|-------------|
-| **8-Channel Gateway** | Telegram, Slack, Discord, WhatsApp, Lark, Email, Webhook, CLI — unified message bus |
+| **9-Channel Gateway** | Telegram, Slack, Discord, WhatsApp (bridge + Cloud), Lark, Email, Webhook, Serial — unified message bus |
+| **Persona System** | Per-chat personality switching via `/persona` command with LTM persistence |
 | **Plugin System** | JSON manifest plugins auto-discovered from `~/.zeptoclaw/plugins/` |
 | **Hooks** | `before_tool`, `after_tool`, `on_error` with Log, Block, and Notify actions |
 | **Cron & Heartbeat** | Schedule recurring tasks, proactive check-ins, background spawning |
@@ -213,12 +217,16 @@ Any provider's base URL can be overridden with `api_base` for proxies or self-ho
 
 | Feature | What it does |
 |---------|-------------|
-| **Container Isolation** | Shell execution in Docker or Apple Container per request |
+| **6 Sandbox Runtimes** | Docker, Apple Container, Landlock, Firejail, Bubblewrap, or native |
+| **Gateway Startup Guard** | Degrade gracefully after N crashes — prevents crash loops |
+| **Channel Supervisor** | Auto-restart dead channels with cooldown and max-restart limits |
 | **Tool Approval Gate** | Policy-based gating — require confirmation for dangerous tools |
-| **SSRF Prevention** | DNS pinning, private IP blocking, scheme validation |
+| **SSRF Prevention** | DNS pinning, private IP blocking, IPv6 transition guard, scheme validation |
 | **Shell Blocklist** | Regex patterns blocking reverse shells, rm -rf, privilege escalation |
 | **Token Budget & Cost** | Per-session budget enforcement, per-model cost estimation for 8 models |
+| **Rich Health Endpoint** | `/health` with version, uptime, RSS, usage metrics, component checks |
 | **Telemetry** | Prometheus + JSON metrics export, structured logging, per-tenant tracing |
+| **Self-Update** | `zeptoclaw update` downloads latest release from GitHub |
 | **Multi-Tenant** | Hundreds of tenants on one VPS — isolated workspaces, ~6MB RAM each |
 
 > **Full documentation** — [zeptoclaw.com/docs](https://zeptoclaw.com/docs/) covers configuration, environment variables, CLI reference, deployment guides, and more.
@@ -227,13 +235,62 @@ Any provider's base URL can be overridden with `api_base` for proxies or self-ho
 
 ZeptoClaw is inspired by projects in the open-source AI agent ecosystem — OpenClaw, NanoClaw, and PicoClaw — each taking a different approach to the same problem. ZeptoClaw's contribution is Rust's memory safety, async performance, and container isolation for production multi-tenant deployments.
 
+## Usage
+
+```bash
+# CLI agent (one-shot)
+zeptoclaw agent -m "Summarize this repo"
+
+# Streaming output
+zeptoclaw agent --stream -m "Explain async Rust"
+
+# Use a template (researcher, coder, task-manager, etc.)
+zeptoclaw agent --template coder -m "Add error handling to main.rs"
+
+# Batch process prompts from a file
+zeptoclaw batch --input prompts.txt --output results.jsonl --format jsonl
+
+# Run as a multi-channel gateway (Telegram, Slack, Discord, etc.)
+zeptoclaw gateway
+
+# With container isolation per request
+zeptoclaw gateway --containerized
+
+# Manage long-term memory
+zeptoclaw memory set project:name "ZeptoClaw" --category project
+zeptoclaw memory search "project"
+
+# Self-update to latest release
+zeptoclaw update
+
+# Encrypt secrets in config
+zeptoclaw secrets encrypt
+```
+
 ## Development
 
 ```bash
-cargo test              # 2,300+ tests
+# Build
+cargo build
+
+# Run all tests (~2,880 total)
+cargo test
+
+# Lint and format (required before every PR)
 cargo clippy -- -D warnings
 cargo fmt -- --check
 ```
+
+See [CLAUDE.md](CLAUDE.md) for full architecture reference, [AGENTS.md](AGENTS.md) for coding guidelines, and [docs/](docs/) for benchmarks, multi-tenant deployment, and performance guides.
+
+## Contributing
+
+We welcome contributions! Please read **[CONTRIBUTING.md](CONTRIBUTING.md)** for:
+
+- How to set up your fork and branch from upstream
+- Issue-first workflow (open an issue before coding)
+- Pull request process and quality gates
+- Guides for adding new tools, channels, and providers
 
 ## License
 

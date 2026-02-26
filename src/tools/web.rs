@@ -1,15 +1,18 @@
 //! Web access tools.
 //!
 //! Provides:
-//! - `web_search`: search the web with Brave Search API.
+//! - `web_search`: search the web with Brave Search API (or DuckDuckGo free fallback).
 //! - `web_fetch`: fetch URL content and extract readable text.
 
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use regex::Regex;
+use once_cell::sync::Lazy;
 use reqwest::{Client, Url};
+use scraper::node::Node;
+use scraper::{ElementRef, Html, Selector};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::net::lookup_host;
@@ -19,6 +22,7 @@ use crate::error::{Result, ZeptoError};
 use super::{Tool, ToolCategory, ToolContext, ToolOutput};
 
 const BRAVE_API_URL: &str = "https://api.search.brave.com/res/v1/web/search";
+const DDG_HTML_URL: &str = "https://html.duckduckgo.com/html/";
 const WEB_USER_AGENT: &str = "zeptoclaw/0.1 (+https://github.com/zeptoclaw/zeptoclaw)";
 const MAX_WEB_SEARCH_COUNT: usize = 10;
 const DEFAULT_MAX_FETCH_CHARS: usize = 50_000;
@@ -27,6 +31,24 @@ const MIN_FETCH_CHARS: usize = 256;
 /// Maximum bytes to read from a response body before truncating.
 /// Uses a 4x multiplier over MAX_FETCH_CHARS to account for multi-byte UTF-8.
 const MAX_FETCH_BYTES: usize = MAX_FETCH_CHARS * 4;
+
+// ---------------------------------------------------------------------------
+// Static CSS selectors (compiled once, reused)
+// ---------------------------------------------------------------------------
+static SEL_TITLE: Lazy<Selector> = Lazy::new(|| Selector::parse("title").unwrap());
+static SEL_MAIN: Lazy<Selector> = Lazy::new(|| Selector::parse("main").unwrap());
+static SEL_ARTICLE: Lazy<Selector> = Lazy::new(|| Selector::parse("article").unwrap());
+static SEL_ROLE_MAIN: Lazy<Selector> = Lazy::new(|| Selector::parse("[role=main]").unwrap());
+static SEL_BODY: Lazy<Selector> = Lazy::new(|| Selector::parse("body").unwrap());
+static SEL_LINKS: Lazy<Selector> = Lazy::new(|| Selector::parse("a[href]").unwrap());
+static SEL_DDG_RESULT_LINK: Lazy<Selector> = Lazy::new(|| Selector::parse("a.result__a").unwrap());
+static SEL_DDG_RESULT_SNIPPET: Lazy<Selector> =
+    Lazy::new(|| Selector::parse("a.result__snippet").unwrap());
+
+const SKIP_ELEMENTS: &[&str] = &[
+    "script", "style", "noscript", "nav", "footer", "header", "aside", "iframe", "svg", "form",
+    "input", "button", "select", "textarea",
+];
 
 /// Web search tool backed by Brave Search.
 pub struct WebSearchTool {
@@ -71,6 +93,13 @@ struct BraveResult {
     title: String,
     url: String,
     #[serde(default)]
+    description: Option<String>,
+}
+
+/// Generic search result used by the DDG backend.
+struct SearchResult {
+    title: String,
+    url: String,
     description: Option<String>,
 }
 
@@ -190,6 +219,183 @@ impl Tool for WebSearchTool {
     }
 }
 
+/// Extract the real URL from a DDG redirect link.
+/// DDG wraps results in `https://duckduckgo.com/l/?uddg=<encoded_url>&...`
+fn extract_ddg_real_url(href: &str) -> String {
+    if let Ok(parsed) = Url::parse(href) {
+        if parsed.host_str() == Some("duckduckgo.com") {
+            if let Some(uddg) = parsed.query_pairs().find(|(k, _)| k == "uddg") {
+                return uddg.1.to_string();
+            }
+        }
+    }
+    href.to_string()
+}
+
+/// Parse DDG HTML search results page into structured results.
+fn parse_ddg_html(html: &str, max_results: usize) -> Vec<SearchResult> {
+    let doc = Html::parse_document(html);
+    let mut results = Vec::new();
+
+    let link_elements: Vec<_> = doc.select(&SEL_DDG_RESULT_LINK).collect();
+    let snippet_elements: Vec<_> = doc.select(&SEL_DDG_RESULT_SNIPPET).collect();
+
+    for (i, link_el) in link_elements.iter().enumerate() {
+        if results.len() >= max_results {
+            break;
+        }
+        let title = link_el.text().collect::<String>().trim().to_string();
+        if title.is_empty() {
+            continue;
+        }
+        let href = link_el.value().attr("href").unwrap_or_default();
+        let url = extract_ddg_real_url(href);
+
+        let description = snippet_elements
+            .get(i)
+            .map(|el| el.text().collect::<String>().trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        results.push(SearchResult {
+            title,
+            url,
+            description,
+        });
+    }
+
+    results
+}
+
+/// Free web search tool backed by DuckDuckGo HTML scraping.
+/// Used as automatic fallback when no Brave API key is configured.
+pub struct DdgSearchTool {
+    client: Client,
+    max_results: usize,
+}
+
+impl Default for DdgSearchTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DdgSearchTool {
+    /// Create a new DDG search tool with default settings.
+    pub fn new() -> Self {
+        Self {
+            client: Client::new(),
+            max_results: 5,
+        }
+    }
+
+    /// Create with custom max results.
+    pub fn with_max_results(max_results: usize) -> Self {
+        Self {
+            client: Client::new(),
+            max_results: max_results.clamp(1, MAX_WEB_SEARCH_COUNT),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for DdgSearchTool {
+    fn name(&self) -> &str {
+        "web_search"
+    }
+
+    fn description(&self) -> &str {
+        "Search the web and return result titles, URLs, and snippets."
+    }
+
+    fn compact_description(&self) -> &str {
+        "Web search"
+    }
+
+    fn category(&self) -> ToolCategory {
+        ToolCategory::NetworkRead
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query"
+                },
+                "count": {
+                    "type": "integer",
+                    "description": "Number of results (1-10)",
+                    "minimum": 1,
+                    "maximum": 10
+                }
+            },
+            "required": ["query"]
+        })
+    }
+
+    async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<ToolOutput> {
+        let query = args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ZeptoError::Tool("Missing 'query' parameter".to_string()))?;
+
+        let count = args
+            .get("count")
+            .and_then(|v| v.as_u64())
+            .map(|c| c as usize)
+            .unwrap_or(self.max_results)
+            .clamp(1, MAX_WEB_SEARCH_COUNT);
+
+        let response = self
+            .client
+            .post(DDG_HTML_URL)
+            .header("User-Agent", WEB_USER_AGENT)
+            .form(&[("q", query)])
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|e| ZeptoError::Tool(format!("DuckDuckGo search failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            return Err(ZeptoError::Tool(format!(
+                "DuckDuckGo search error: {}",
+                response.status()
+            )));
+        }
+
+        let html = response
+            .text()
+            .await
+            .map_err(|e| ZeptoError::Tool(format!("Failed to read DDG response: {}", e)))?;
+
+        let results = parse_ddg_html(&html, count);
+
+        if results.is_empty() {
+            return Ok(ToolOutput::user_visible(format!(
+                "No web search results found for '{}'.",
+                query
+            )));
+        }
+
+        let mut output = format!("Web search results for '{}':\n\n", query);
+        for (index, item) in results.iter().enumerate() {
+            output.push_str(&format!("{}. {}\n", index + 1, item.title));
+            output.push_str(&format!("   {}\n", item.url));
+            if let Some(desc) = item.description.as_deref().map(str::trim) {
+                if !desc.is_empty() {
+                    output.push_str(&format!("   {}\n", desc));
+                }
+            }
+            output.push('\n');
+        }
+
+        Ok(ToolOutput::user_visible(output.trim_end().to_string()))
+    }
+}
+
 /// Web fetch tool for URL content retrieval.
 pub struct WebFetchTool {
     client: Client,
@@ -218,29 +424,42 @@ impl WebFetchTool {
         tool
     }
 
-    fn extract_title(&self, html: &str) -> Option<String> {
-        let regex = Regex::new(r"(?is)<title[^>]*>(.*?)</title>").ok()?;
-        let captures = regex.captures(html)?;
-        let raw = captures.get(1)?.as_str();
-        normalize_whitespace(&decode_common_html_entities(raw))
-            .trim()
-            .to_string()
-            .into()
+    fn extract_title_from_doc(&self, document: &Html) -> Option<String> {
+        let el = document.select(&SEL_TITLE).next()?;
+        let raw: String = el.text().collect();
+        let title = normalize_whitespace(&raw);
+        if title.is_empty() {
+            None
+        } else {
+            Some(title)
+        }
     }
 
+    #[cfg(test)]
     fn extract_text(&self, html: &str) -> String {
-        let without_scripts = strip_regex(html, r"(?is)<script[^>]*>.*?</script>", " ");
-        let without_styles = strip_regex(&without_scripts, r"(?is)<style[^>]*>.*?</style>", " ");
-        let without_noscript =
-            strip_regex(&without_styles, r"(?is)<noscript[^>]*>.*?</noscript>", " ");
-        let with_line_breaks = strip_regex(
-            &without_noscript,
-            r"(?i)</?(p|div|h[1-6]|li|tr|td|th|br)\b[^>]*>",
-            "\n",
-        );
-        let without_tags = strip_regex(&with_line_breaks, r"(?is)<[^>]+>", " ");
+        let document = Html::parse_document(html);
+        self.extract_text_from_doc(&document, false, "")
+    }
 
-        normalize_whitespace(&decode_common_html_entities(&without_tags))
+    fn extract_text_from_doc(
+        &self,
+        document: &Html,
+        include_links: bool,
+        base_url: &str,
+    ) -> String {
+        let md = if let Some(root) = find_content_root(document) {
+            dom_to_markdown(root)
+        } else {
+            String::new()
+        };
+        let mut result = normalize_whitespace_md(&md);
+        if include_links {
+            let links = extract_links(document, base_url);
+            if !links.is_empty() {
+                result.push_str(&links);
+            }
+        }
+        result
     }
 }
 
@@ -281,6 +500,10 @@ impl Tool for WebFetchTool {
                     "description": "Maximum output characters",
                     "minimum": MIN_FETCH_CHARS,
                     "maximum": MAX_FETCH_CHARS
+                },
+                "include_links": {
+                    "type": "boolean",
+                    "description": "Include a list of links found on the page"
                 }
             },
             "required": ["url"]
@@ -374,11 +597,17 @@ impl Tool for WebFetchTool {
         // allocation from malicious or oversized responses.
         let body = read_body_limited(response, MAX_FETCH_BYTES).await?;
 
+        let include_links = args
+            .get("include_links")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         let (extractor, mut text) = if content_type.contains("application/json") {
             ("json", body)
         } else if content_type.contains("text/html") || body.trim_start().starts_with('<') {
-            let title = self.extract_title(&body).unwrap_or_default();
-            let extracted = self.extract_text(&body);
+            let document = Html::parse_document(&body);
+            let title = self.extract_title_from_doc(&document).unwrap_or_default();
+            let extracted = self.extract_text_from_doc(&document, include_links, &final_url);
             if title.is_empty() {
                 ("html", extracted)
             } else {
@@ -413,13 +642,6 @@ impl Tool for WebFetchTool {
     }
 }
 
-fn strip_regex(input: &str, pattern: &str, replacement: &str) -> String {
-    match Regex::new(pattern) {
-        Ok(regex) => regex.replace_all(input, replacement).into_owned(),
-        Err(_) => input.to_string(),
-    }
-}
-
 fn normalize_whitespace(input: &str) -> String {
     input
         .split_whitespace()
@@ -429,13 +651,343 @@ fn normalize_whitespace(input: &str) -> String {
         .to_string()
 }
 
-fn decode_common_html_entities(input: &str) -> String {
-    let mut decoded = input.replace("&nbsp;", " ");
-    decoded = decoded.replace("&amp;", "&");
-    decoded = decoded.replace("&lt;", "<");
-    decoded = decoded.replace("&gt;", ">");
-    decoded = decoded.replace("&quot;", "\"");
-    decoded.replace("&#39;", "'")
+fn decode_html_entities(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch != '&' {
+            output.push(ch);
+            continue;
+        }
+        // Accumulate entity text between & and ;
+        let mut entity = String::new();
+        let mut found_semi = false;
+        // Cap entity length to avoid unbounded accumulation on malformed input
+        for _ in 0..12 {
+            match chars.peek() {
+                Some(&';') => {
+                    chars.next();
+                    found_semi = true;
+                    break;
+                }
+                Some(_) => entity.push(chars.next().unwrap()),
+                None => break,
+            }
+        }
+        if !found_semi {
+            // Not a valid entity — emit raw characters
+            output.push('&');
+            output.push_str(&entity);
+            continue;
+        }
+        match decode_entity(&entity) {
+            Some(decoded) => output.push_str(decoded),
+            None => {
+                // Numeric entities
+                if let Some(stripped) = entity.strip_prefix('#') {
+                    let code = if let Some(hex) =
+                        stripped.strip_prefix('x').or(stripped.strip_prefix('X'))
+                    {
+                        u32::from_str_radix(hex, 16).ok()
+                    } else {
+                        stripped.parse::<u32>().ok()
+                    };
+                    if let Some(c) = code.and_then(char::from_u32) {
+                        output.push(c);
+                    } else {
+                        output.push('&');
+                        output.push_str(&entity);
+                        output.push(';');
+                    }
+                } else {
+                    // Unknown named entity — pass through
+                    output.push('&');
+                    output.push_str(&entity);
+                    output.push(';');
+                }
+            }
+        }
+    }
+    output
+}
+
+fn decode_entity(name: &str) -> Option<&'static str> {
+    match name {
+        "amp" => Some("&"),
+        "lt" => Some("<"),
+        "gt" => Some(">"),
+        "quot" => Some("\""),
+        "apos" | "#39" => Some("'"),
+        "nbsp" => Some(" "),
+        "mdash" => Some("\u{2014}"),
+        "ndash" => Some("\u{2013}"),
+        "lsquo" => Some("\u{2018}"),
+        "rsquo" => Some("\u{2019}"),
+        "ldquo" => Some("\u{201C}"),
+        "rdquo" => Some("\u{201D}"),
+        "hellip" => Some("\u{2026}"),
+        "copy" => Some("\u{00A9}"),
+        "reg" => Some("\u{00AE}"),
+        "trade" => Some("\u{2122}"),
+        "bull" => Some("\u{2022}"),
+        _ => None,
+    }
+}
+
+/// Normalize whitespace while preserving line structure for markdown.
+/// Collapses horizontal whitespace per line, preserves newlines,
+/// and collapses 3+ consecutive blank lines to 2.
+fn normalize_whitespace_md(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut blank_count = 0u32;
+
+    for line in input.lines() {
+        let trimmed: String = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if trimmed.is_empty() {
+            blank_count += 1;
+            if blank_count <= 2 {
+                output.push('\n');
+            }
+        } else {
+            blank_count = 0;
+            if !output.is_empty() && !output.ends_with('\n') {
+                output.push('\n');
+            }
+            output.push_str(&trimmed);
+            output.push('\n');
+        }
+    }
+    // Trim trailing newlines to at most one
+    let trimmed = output.trim_end_matches('\n');
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", trimmed)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DOM-based content extraction
+// ---------------------------------------------------------------------------
+
+/// Find the best content root in a parsed HTML document.
+/// Tries selectors in priority: main → article → [role=main] → body.
+fn find_content_root(document: &Html) -> Option<ElementRef<'_>> {
+    document
+        .select(&SEL_MAIN)
+        .next()
+        .or_else(|| document.select(&SEL_ARTICLE).next())
+        .or_else(|| document.select(&SEL_ROLE_MAIN).next())
+        .or_else(|| document.select(&SEL_BODY).next())
+}
+
+/// Convert an HTML element subtree to markdown.
+fn dom_to_markdown(element: ElementRef<'_>) -> String {
+    let mut output = String::new();
+    dom_walk(element, &mut output);
+    output
+}
+
+fn dom_walk(element: ElementRef<'_>, output: &mut String) {
+    for child in element.children() {
+        match child.value() {
+            Node::Text(text) => {
+                output.push_str(&decode_html_entities(text));
+            }
+            Node::Element(el) => {
+                let tag = el.name.local.as_ref();
+                if SKIP_ELEMENTS.contains(&tag) {
+                    continue;
+                }
+                // Safe: child is an element node, so ElementRef::wrap is valid
+                let Some(child_ref) = ElementRef::wrap(child) else {
+                    continue;
+                };
+                match tag {
+                    "h1" => {
+                        output.push_str("\n\n# ");
+                        output.push_str(&collect_inline_text(child_ref));
+                        output.push_str("\n\n");
+                    }
+                    "h2" => {
+                        output.push_str("\n\n## ");
+                        output.push_str(&collect_inline_text(child_ref));
+                        output.push_str("\n\n");
+                    }
+                    "h3" => {
+                        output.push_str("\n\n### ");
+                        output.push_str(&collect_inline_text(child_ref));
+                        output.push_str("\n\n");
+                    }
+                    "h4" => {
+                        output.push_str("\n\n#### ");
+                        output.push_str(&collect_inline_text(child_ref));
+                        output.push_str("\n\n");
+                    }
+                    "h5" => {
+                        output.push_str("\n\n##### ");
+                        output.push_str(&collect_inline_text(child_ref));
+                        output.push_str("\n\n");
+                    }
+                    "h6" => {
+                        output.push_str("\n\n###### ");
+                        output.push_str(&collect_inline_text(child_ref));
+                        output.push_str("\n\n");
+                    }
+                    "a" => {
+                        let href = el.attr("href").unwrap_or("");
+                        let text = collect_inline_text(child_ref);
+                        if text.is_empty() {
+                            output.push_str(href);
+                        } else {
+                            output.push('[');
+                            output.push_str(&text);
+                            output.push_str("](");
+                            output.push_str(href);
+                            output.push(')');
+                        }
+                    }
+                    "strong" | "b" => {
+                        let text = collect_inline_text(child_ref);
+                        if !text.is_empty() {
+                            output.push_str("**");
+                            output.push_str(&text);
+                            output.push_str("**");
+                        }
+                    }
+                    "em" | "i" => {
+                        let text = collect_inline_text(child_ref);
+                        if !text.is_empty() {
+                            output.push('*');
+                            output.push_str(&text);
+                            output.push('*');
+                        }
+                    }
+                    "code" => {
+                        let text = collect_inline_text(child_ref);
+                        if !text.is_empty() {
+                            output.push('`');
+                            output.push_str(&text);
+                            output.push('`');
+                        }
+                    }
+                    "pre" => {
+                        let text = collect_raw_text(child_ref);
+                        output.push_str("\n\n```\n");
+                        output.push_str(&text);
+                        output.push_str("\n```\n\n");
+                    }
+                    "li" => {
+                        output.push_str("\n- ");
+                        dom_walk(child_ref, output);
+                    }
+                    "br" => {
+                        output.push('\n');
+                    }
+                    "hr" => {
+                        output.push_str("\n\n---\n\n");
+                    }
+                    "blockquote" => {
+                        let inner = dom_to_markdown(child_ref);
+                        for line in inner.lines() {
+                            output.push_str("> ");
+                            output.push_str(line);
+                            output.push('\n');
+                        }
+                    }
+                    "img" => {
+                        let alt = el.attr("alt").unwrap_or("");
+                        let src = el.attr("src").unwrap_or("");
+                        if !src.is_empty() {
+                            output.push_str("![");
+                            output.push_str(alt);
+                            output.push_str("](");
+                            output.push_str(src);
+                            output.push(')');
+                        }
+                    }
+                    "p" | "div" | "section" | "main" | "article" => {
+                        output.push_str("\n\n");
+                        dom_walk(child_ref, output);
+                        output.push_str("\n\n");
+                    }
+                    "ul" | "ol" => {
+                        output.push('\n');
+                        dom_walk(child_ref, output);
+                        output.push('\n');
+                    }
+                    "td" | "th" => {
+                        dom_walk(child_ref, output);
+                        output.push_str(" | ");
+                    }
+                    _ => {
+                        dom_walk(child_ref, output);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Collect all descendant text from an element, stripping inner tags.
+fn collect_inline_text(element: ElementRef<'_>) -> String {
+    element
+        .text()
+        .collect::<Vec<_>>()
+        .join("")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Collect raw text preserving whitespace (for `<pre>` blocks).
+fn collect_raw_text(element: ElementRef<'_>) -> String {
+    element.text().collect::<String>()
+}
+
+/// Extract deduplicated links from a parsed HTML document.
+fn extract_links(document: &Html, base_url: &str) -> String {
+    let base = Url::parse(base_url).ok();
+    let mut seen = HashSet::new();
+    let mut links = Vec::new();
+
+    for el in document.select(&SEL_LINKS) {
+        let Some(href) = el.value().attr("href") else {
+            continue;
+        };
+        let href = href.trim();
+        // Skip fragment-only anchors and empty hrefs
+        if href.is_empty() || href.starts_with('#') {
+            continue;
+        }
+        // Resolve relative URLs
+        let resolved = if href.starts_with("http://") || href.starts_with("https://") {
+            href.to_string()
+        } else if let Some(ref base) = base {
+            match base.join(href) {
+                Ok(u) => u.to_string(),
+                Err(_) => continue,
+            }
+        } else {
+            continue;
+        };
+        if seen.insert(resolved.clone()) {
+            let text = collect_inline_text(el);
+            if text.is_empty() {
+                links.push(format!("- {}", resolved));
+            } else {
+                links.push(format!("- [{}]({})", text, resolved));
+            }
+        }
+    }
+
+    if links.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n## Links\n\n{}\n", links.join("\n"))
+    }
 }
 
 /// Read a response body in chunks, enforcing a maximum byte limit.
@@ -670,7 +1222,11 @@ mod tests {
     fn test_extract_title() {
         let tool = WebFetchTool::new();
         let html = "<html><head><title> Test Page </title></head><body>x</body></html>";
-        assert_eq!(tool.extract_title(html), Some("Test Page".to_string()));
+        let doc = Html::parse_document(html);
+        assert_eq!(
+            tool.extract_title_from_doc(&doc),
+            Some("Test Page".to_string())
+        );
     }
 
     #[test]
@@ -688,7 +1244,11 @@ mod tests {
         "#;
 
         let text = tool.extract_text(html);
-        assert!(text.contains("Hello"));
+        assert!(
+            text.contains("# Hello"),
+            "Expected markdown heading, got: {}",
+            text
+        );
         assert!(text.contains("World"));
         assert!(!text.contains("alert"));
         assert!(!text.contains("color:"));
@@ -1061,5 +1621,401 @@ mod tests {
             !is_private_or_local_ip(public_6to4),
             "6to4 with public IP (2002:0808:0808::) should NOT be blocked"
         );
+    }
+
+    // ==================== HTML ENTITY DECODING TESTS ====================
+
+    #[test]
+    fn test_decode_named_entities() {
+        assert_eq!(decode_html_entities("&amp; &lt; &gt;"), "& < >");
+        assert_eq!(decode_html_entities("&quot;hi&quot;"), "\"hi\"");
+        assert_eq!(decode_html_entities("&nbsp;"), " ");
+        assert_eq!(decode_html_entities("&#39;"), "'");
+        assert_eq!(decode_html_entities("&apos;"), "'");
+    }
+
+    #[test]
+    fn test_decode_typography_entities() {
+        assert_eq!(decode_html_entities("&mdash;"), "\u{2014}");
+        assert_eq!(decode_html_entities("&ndash;"), "\u{2013}");
+        assert_eq!(
+            decode_html_entities("&ldquo;hi&rdquo;"),
+            "\u{201C}hi\u{201D}"
+        );
+        assert_eq!(decode_html_entities("&hellip;"), "\u{2026}");
+        assert_eq!(decode_html_entities("&copy;"), "\u{00A9}");
+        assert_eq!(decode_html_entities("&bull;"), "\u{2022}");
+    }
+
+    #[test]
+    fn test_decode_numeric_decimal() {
+        assert_eq!(decode_html_entities("&#65;"), "A");
+        assert_eq!(decode_html_entities("&#169;"), "\u{00A9}");
+        assert_eq!(decode_html_entities("&#8212;"), "\u{2014}");
+    }
+
+    #[test]
+    fn test_decode_numeric_hex() {
+        assert_eq!(decode_html_entities("&#x41;"), "A");
+        assert_eq!(decode_html_entities("&#xA9;"), "\u{00A9}");
+        assert_eq!(decode_html_entities("&#x2014;"), "\u{2014}");
+    }
+
+    #[test]
+    fn test_decode_unknown_entity_passthrough() {
+        assert_eq!(decode_html_entities("&foobar;"), "&foobar;");
+        assert_eq!(decode_html_entities("&unknown;"), "&unknown;");
+    }
+
+    #[test]
+    fn test_decode_no_semicolon_passthrough() {
+        // & without matching ; should pass through raw
+        assert_eq!(decode_html_entities("AT&T rocks"), "AT&T rocks");
+    }
+
+    #[test]
+    fn test_normalize_whitespace_md_preserves_lines() {
+        let input = "Hello  world\n\nSecond   paragraph\n";
+        let result = normalize_whitespace_md(input);
+        assert!(result.contains("Hello world\n"));
+        assert!(result.contains("Second paragraph\n"));
+    }
+
+    #[test]
+    fn test_normalize_whitespace_md_collapses_blank_lines() {
+        let input = "A\n\n\n\n\nB\n";
+        let result = normalize_whitespace_md(input);
+        // 3+ blank lines should be collapsed to 2
+        assert!(!result.contains("\n\n\n\n"));
+        assert!(result.contains("A\n"));
+        assert!(result.contains("B\n"));
+    }
+
+    // ==================== DOM WALKER TESTS ====================
+
+    #[test]
+    fn test_dom_headings() {
+        let doc = Html::parse_document(
+            "<html><body><h1>Title</h1><h2>Sub</h2><h3>Sub3</h3></body></html>",
+        );
+        let root = find_content_root(&doc).unwrap();
+        let md = dom_to_markdown(root);
+        assert!(md.contains("# Title"));
+        assert!(md.contains("## Sub"));
+        assert!(md.contains("### Sub3"));
+    }
+
+    #[test]
+    fn test_dom_links() {
+        let doc = Html::parse_document(r#"<body><a href="https://example.com">Click</a></body>"#);
+        let root = find_content_root(&doc).unwrap();
+        let md = dom_to_markdown(root);
+        assert!(md.contains("[Click](https://example.com)"));
+    }
+
+    #[test]
+    fn test_dom_bold_italic() {
+        let doc = Html::parse_document("<body><strong>bold</strong> and <em>italic</em></body>");
+        let root = find_content_root(&doc).unwrap();
+        let md = dom_to_markdown(root);
+        assert!(md.contains("**bold**"));
+        assert!(md.contains("*italic*"));
+    }
+
+    #[test]
+    fn test_dom_code_inline_and_block() {
+        let doc = Html::parse_document("<body><code>inline</code><pre>code\nblock</pre></body>");
+        let root = find_content_root(&doc).unwrap();
+        let md = dom_to_markdown(root);
+        assert!(md.contains("`inline`"));
+        assert!(md.contains("```\ncode\nblock\n```"));
+    }
+
+    #[test]
+    fn test_dom_lists() {
+        let doc = Html::parse_document("<body><ul><li>one</li><li>two</li></ul></body>");
+        let root = find_content_root(&doc).unwrap();
+        let md = dom_to_markdown(root);
+        assert!(md.contains("- one"));
+        assert!(md.contains("- two"));
+    }
+
+    #[test]
+    fn test_dom_skips_nav_footer() {
+        let doc = Html::parse_document(
+            "<body><nav>Skip me</nav><p>Content</p><footer>Skip too</footer></body>",
+        );
+        let root = find_content_root(&doc).unwrap();
+        let md = dom_to_markdown(root);
+        assert!(!md.contains("Skip me"));
+        assert!(!md.contains("Skip too"));
+        assert!(md.contains("Content"));
+    }
+
+    #[test]
+    fn test_dom_skips_script_style() {
+        let doc = Html::parse_document(
+            "<body><script>alert('x')</script><style>body{}</style><p>Visible</p></body>",
+        );
+        let root = find_content_root(&doc).unwrap();
+        let md = dom_to_markdown(root);
+        assert!(!md.contains("alert"));
+        assert!(!md.contains("body{}"));
+        assert!(md.contains("Visible"));
+    }
+
+    #[test]
+    fn test_dom_content_targeting_main() {
+        let doc = Html::parse_document(
+            "<html><body><nav>Menu</nav><main><p>Main content</p></main></body></html>",
+        );
+        let root = find_content_root(&doc).unwrap();
+        let tag = root.value().name.local.as_ref();
+        assert_eq!(tag, "main");
+        let md = dom_to_markdown(root);
+        assert!(md.contains("Main content"));
+        assert!(!md.contains("Menu"));
+    }
+
+    #[test]
+    fn test_dom_content_targeting_article() {
+        let doc = Html::parse_document(
+            "<html><body><aside>Sidebar</aside><article><p>Article body</p></article></body></html>",
+        );
+        let root = find_content_root(&doc).unwrap();
+        let tag = root.value().name.local.as_ref();
+        assert_eq!(tag, "article");
+    }
+
+    #[test]
+    fn test_dom_nested_formatting() {
+        let doc = Html::parse_document(
+            "<body><p>Hello <strong>bold <em>and italic</em></strong></p></body>",
+        );
+        let root = find_content_root(&doc).unwrap();
+        let md = dom_to_markdown(root);
+        assert!(md.contains("**bold and italic**"));
+    }
+
+    #[test]
+    fn test_dom_empty_body() {
+        let doc = Html::parse_document("<html><head></head><body></body></html>");
+        let root = find_content_root(&doc).unwrap();
+        let md = dom_to_markdown(root);
+        assert!(md.trim().is_empty());
+    }
+
+    #[test]
+    fn test_dom_blockquote() {
+        let doc = Html::parse_document("<body><blockquote>Quoted text</blockquote></body>");
+        let root = find_content_root(&doc).unwrap();
+        let md = dom_to_markdown(root);
+        assert!(md.contains("> Quoted text"));
+    }
+
+    #[test]
+    fn test_dom_image() {
+        let doc = Html::parse_document(
+            r#"<body><img alt="photo" src="https://example.com/img.jpg"></body>"#,
+        );
+        let root = find_content_root(&doc).unwrap();
+        let md = dom_to_markdown(root);
+        assert!(md.contains("![photo](https://example.com/img.jpg)"));
+    }
+
+    #[test]
+    fn test_dom_hr() {
+        let doc = Html::parse_document("<body><p>Before</p><hr><p>After</p></body>");
+        let root = find_content_root(&doc).unwrap();
+        let md = dom_to_markdown(root);
+        assert!(md.contains("---"));
+    }
+
+    // ==================== LINK EXTRACTION TESTS ====================
+
+    #[test]
+    fn test_extract_links_absolute_urls() {
+        let doc = Html::parse_document(
+            r#"<body>
+                <a href="https://example.com/a">Link A</a>
+                <a href="https://example.com/b">Link B</a>
+            </body>"#,
+        );
+        let links = extract_links(&doc, "https://example.com/");
+        assert!(links.contains("[Link A](https://example.com/a)"));
+        assert!(links.contains("[Link B](https://example.com/b)"));
+        assert!(links.contains("## Links"));
+    }
+
+    #[test]
+    fn test_extract_links_deduplicates() {
+        let doc = Html::parse_document(
+            r#"<body>
+                <a href="https://example.com/a">First</a>
+                <a href="https://example.com/a">Second</a>
+            </body>"#,
+        );
+        let links = extract_links(&doc, "https://example.com/");
+        // Should only appear once
+        let count = links.matches("example.com/a").count();
+        assert_eq!(count, 1, "Duplicate URL should be deduplicated");
+    }
+
+    #[test]
+    fn test_extract_links_skips_anchors() {
+        let doc = Html::parse_document(
+            r##"<body>
+                <a href="#section">Anchor</a>
+                <a href="">Empty</a>
+                <a href="https://real.com">Real</a>
+            </body>"##,
+        );
+        let links = extract_links(&doc, "https://example.com/");
+        assert!(!links.contains("#section"));
+        assert!(links.contains("https://real.com"));
+    }
+
+    #[test]
+    fn test_extract_links_resolves_relative() {
+        let doc = Html::parse_document(r#"<body><a href="/about">About</a></body>"#);
+        let links = extract_links(&doc, "https://example.com/page");
+        assert!(
+            links.contains("https://example.com/about"),
+            "Relative URL should resolve against base. Got: {}",
+            links
+        );
+    }
+
+    #[test]
+    fn test_extract_links_empty_when_none() {
+        let doc = Html::parse_document("<body><p>No links here</p></body>");
+        let links = extract_links(&doc, "https://example.com/");
+        assert!(links.is_empty());
+    }
+
+    #[test]
+    fn test_extract_text_with_include_links() {
+        let tool = WebFetchTool::new();
+        let html = r#"<body><p>Content</p><a href="https://example.com">Link</a></body>"#;
+        let doc = Html::parse_document(html);
+        let text = tool.extract_text_from_doc(&doc, true, "https://example.com/");
+        assert!(text.contains("Content"));
+        assert!(text.contains("## Links"));
+        assert!(text.contains("https://example.com"));
+    }
+
+    // ==================== DDG SEARCH PARSING TESTS ====================
+
+    #[test]
+    fn test_parse_ddg_results_basic() {
+        let html = r#"<html><body>
+            <div class="results">
+                <div class="result">
+                    <a class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpage&amp;rut=abc">Example Page</a>
+                    <a class="result__snippet">This is the snippet for example page.</a>
+                </div>
+            </div>
+        </body></html>"#;
+        let results = parse_ddg_html(html, 5);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Example Page");
+        assert_eq!(results[0].url, "https://example.com/page");
+        assert_eq!(
+            results[0].description,
+            Some("This is the snippet for example page.".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_ddg_results_multiple() {
+        let html = r#"<html><body>
+            <div class="results">
+                <div class="result">
+                    <a class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fa.com">A</a>
+                    <a class="result__snippet">Snippet A</a>
+                </div>
+                <div class="result">
+                    <a class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fb.com">B</a>
+                    <a class="result__snippet">Snippet B</a>
+                </div>
+                <div class="result">
+                    <a class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fc.com">C</a>
+                    <a class="result__snippet">Snippet C</a>
+                </div>
+            </div>
+        </body></html>"#;
+        let results = parse_ddg_html(html, 2);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].title, "A");
+        assert_eq!(results[1].title, "B");
+    }
+
+    #[test]
+    fn test_parse_ddg_results_empty() {
+        let html = "<html><body><div class='results'></div></body></html>";
+        let results = parse_ddg_html(html, 5);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_parse_ddg_direct_url() {
+        let html = r#"<html><body>
+            <div class="results">
+                <div class="result">
+                    <a class="result__a" href="https://example.com/direct">Direct Link</a>
+                    <a class="result__snippet">Direct snippet</a>
+                </div>
+            </div>
+        </body></html>"#;
+        let results = parse_ddg_html(html, 5);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].url, "https://example.com/direct");
+    }
+
+    #[test]
+    fn test_extract_ddg_url_with_uddg() {
+        let url = "https://duckduckgo.com/l/?uddg=https%3A%2F%2Frust-lang.org%2Flearn&rut=abc";
+        assert_eq!(extract_ddg_real_url(url), "https://rust-lang.org/learn");
+    }
+
+    #[test]
+    fn test_extract_ddg_url_direct() {
+        let url = "https://example.com/page";
+        assert_eq!(extract_ddg_real_url(url), "https://example.com/page");
+    }
+
+    #[test]
+    fn test_extract_ddg_url_no_uddg_param() {
+        let url = "https://duckduckgo.com/l/?other=value";
+        assert_eq!(
+            extract_ddg_real_url(url),
+            "https://duckduckgo.com/l/?other=value"
+        );
+    }
+
+    // ==================== DDG SEARCH TOOL TESTS ====================
+
+    #[test]
+    fn test_ddg_search_tool_name() {
+        let tool = DdgSearchTool::new();
+        assert_eq!(tool.name(), "web_search");
+    }
+
+    #[test]
+    fn test_ddg_search_tool_description() {
+        let tool = DdgSearchTool::new();
+        assert!(!tool.description().is_empty());
+    }
+
+    #[test]
+    fn test_ddg_search_tool_parameters() {
+        let tool = DdgSearchTool::new();
+        let params = tool.parameters();
+        assert_eq!(params["type"], "object");
+        assert!(params["properties"]["query"].is_object());
+        assert!(params["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("query")));
     }
 }

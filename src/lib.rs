@@ -36,7 +36,7 @@ pub mod transcription;
 pub mod tunnel;
 pub mod utils;
 
-pub use agent::{AgentLoop, ContextBuilder, SwarmScratchpad};
+pub use agent::{AgentLoop, ContextBuilder, SwarmScratchpad, ZeptoAgent, ZeptoAgentBuilder};
 pub use bus::{InboundMessage, MediaAttachment, MediaType, MessageBus, OutboundMessage};
 pub use channels::{
     BaseChannelConfig, Channel, ChannelManager, ChannelPluginAdapter, SlackChannel,
@@ -61,11 +61,11 @@ pub use gateway::is_apple_container_available;
 pub use gateway::{
     generate_env_file_content, is_docker_available, is_docker_available_with_binary,
     parse_marked_response, resolve_backend, AgentRequest, AgentResponse, AgentResult,
-    ContainerAgentProxy, ResolvedBackend, RESPONSE_END_MARKER, RESPONSE_START_MARKER,
+    ContainerAgentProxy, ResolvedBackend, StartupGuard, RESPONSE_END_MARKER, RESPONSE_START_MARKER,
 };
 pub use health::{
-    health_port, start_health_server, start_health_server_legacy, start_periodic_usage_flush,
-    HealthCheck, HealthRegistry, HealthStatus, UsageMetrics,
+    get_rss_bytes, health_port, start_health_server, start_health_server_legacy,
+    start_periodic_usage_flush, HealthCheck, HealthRegistry, HealthStatus, UsageMetrics,
 };
 
 #[cfg(target_os = "macos")]
@@ -80,9 +80,12 @@ pub use session::{Message, Role, Session, SessionManager, ToolCall};
 pub use tools::screenshot::WebScreenshotTool;
 #[cfg(feature = "android")]
 pub use tools::AndroidTool;
+#[cfg(feature = "google")]
+pub use tools::GoogleTool;
 pub use tools::{
-    cron::CronTool, custom::CustomTool, delegate::DelegateTool, spawn::SpawnTool, BinaryPluginTool,
-    EchoTool, GitTool, GoogleSheetsTool, HardwareTool, HttpRequestTool, MemoryGetTool,
-    MemorySearchTool, MessageTool, PdfReadTool, ProjectTool, R8rTool, ReminderTool, StripeTool,
-    Tool, ToolCategory, ToolContext, ToolRegistry, WebFetchTool, WebSearchTool, WhatsAppTool,
+    composed::CreateToolTool, cron::CronTool, custom::CustomTool, delegate::DelegateTool,
+    spawn::SpawnTool, BinaryPluginTool, EchoTool, GitTool, GoogleSheetsTool, HardwareTool,
+    HttpRequestTool, MemoryGetTool, MemorySearchTool, MessageTool, PdfReadTool, ProjectTool,
+    R8rTool, ReminderTool, StripeTool, Tool, ToolCategory, ToolContext, ToolRegistry, WebFetchTool,
+    WebSearchTool, WhatsAppTool,
 };

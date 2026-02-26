@@ -355,6 +355,7 @@ impl LLMProvider for GeminiProvider {
             .client
             .post(self.api_url(model))
             .header("Content-Type", "application/json")
+            .header("X-Title", "ZeptoClaw")
             .json(&body);
 
         let request = self.apply_auth(request);

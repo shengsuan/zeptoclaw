@@ -638,6 +638,7 @@ impl LLMProvider for OpenAIProvider {
                 .post(format!("{}/chat/completions", self.api_base))
                 .header("Authorization", format!("Bearer {}", self.api_key))
                 .header("Content-Type", "application/json")
+                .header("X-Title", "ZeptoClaw")
                 .json(&request)
                 .send()
                 .await
@@ -721,6 +722,7 @@ impl LLMProvider for OpenAIProvider {
                 .post(format!("{}/chat/completions", self.api_base))
                 .header("Authorization", format!("Bearer {}", self.api_key))
                 .header("Content-Type", "application/json")
+                .header("X-Title", "ZeptoClaw")
                 .json(&request)
                 .send()
                 .await
@@ -867,6 +869,7 @@ impl LLMProvider for OpenAIProvider {
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
+            .header("X-Title", "ZeptoClaw")
             .json(&body)
             .send()
             .await

@@ -31,10 +31,12 @@ use zeptoclaw::tools::delegate::DelegateTool;
 use zeptoclaw::tools::filesystem::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool};
 use zeptoclaw::tools::shell::ShellTool;
 use zeptoclaw::tools::spawn::SpawnTool;
+#[cfg(feature = "google")]
+use zeptoclaw::tools::GoogleTool;
 use zeptoclaw::tools::{
-    EchoTool, FindSkillsTool, GitTool, GoogleSheetsTool, HttpRequestTool, InstallSkillTool,
-    MemoryGetTool, MemorySearchTool, MessageTool, PdfReadTool, ProjectTool, R8rTool,
-    TranscribeTool, WebFetchTool, WebSearchTool, WhatsAppTool,
+    DdgSearchTool, EchoTool, FindSkillsTool, GitTool, GoogleSheetsTool, HttpRequestTool,
+    InstallSkillTool, MemoryGetTool, MemorySearchTool, MessageTool, PdfReadTool, ProjectTool,
+    R8rTool, TranscribeTool, WebFetchTool, WebSearchTool, WhatsAppTool,
 };
 
 /// Read a line from stdin, trimming whitespace.
@@ -178,6 +180,8 @@ fn provider_from_runtime_selection(
 struct RuntimeProviderCandidate {
     name: &'static str,
     provider: Box<dyn LLMProvider>,
+    /// Per-provider model override from config.
+    model: Option<String>,
 }
 
 fn apply_fallback_preference(
@@ -234,6 +238,7 @@ fn build_runtime_provider_chain(
             candidates.push(RuntimeProviderCandidate {
                 name: selection.name,
                 provider,
+                model: selection.model.clone(),
             });
         } else {
             warn!(
@@ -269,8 +274,10 @@ fn build_runtime_provider_chain(
 
         for candidate in ordered_iter {
             provider_names.push(candidate.name);
-            provider_chain = Box::new(FallbackProvider::new(provider_chain, candidate.provider))
-                as Box<dyn LLMProvider>;
+            provider_chain = Box::new(
+                FallbackProvider::new(provider_chain, candidate.provider)
+                    .with_fallback_model(candidate.model.clone()),
+            ) as Box<dyn LLMProvider>;
         }
 
         return Some((provider_chain, provider_names));
@@ -288,7 +295,8 @@ fn apply_retry_wrapper(provider: Box<dyn LLMProvider>, config: &Config) -> Box<d
         RetryProvider::new(provider)
             .with_max_retries(config.providers.retry.max_retries)
             .with_base_delay_ms(config.providers.retry.base_delay_ms)
-            .with_max_delay_ms(config.providers.retry.max_delay_ms),
+            .with_max_delay_ms(config.providers.retry.max_delay_ms)
+            .with_retry_budget_ms(config.providers.retry.retry_budget_ms),
     )
 }
 
@@ -469,8 +477,20 @@ pub(crate) async fn create_agent_with_template(
             None
         };
 
+    // Build deny set from config (e.g. startup guard degraded mode)
+    let deny_tools: HashSet<String> = config
+        .tools
+        .deny
+        .iter()
+        .map(|n| n.to_ascii_lowercase())
+        .collect();
+
     let tool_enabled = |name: &str| {
         let key = name.to_ascii_lowercase();
+        // Deny list (startup guard degraded mode, etc.)
+        if deny_tools.contains(&key) {
+            return false;
+        }
         // Profile filter (if active)
         if let Some(ref profile) = profile_tools {
             if !profile.contains(&key) {
@@ -633,17 +653,25 @@ Enable runtime.allow_fallback_to_native to opt in to native fallback.",
 
     // Register web tools.
     if tool_enabled("web_search") {
-        if let Some(web_search_key) = config.tools.web.search.api_key.as_deref() {
-            let web_search_key = web_search_key.trim();
-            if !web_search_key.is_empty() {
-                agent
-                    .register_tool(Box::new(WebSearchTool::with_max_results(
-                        web_search_key,
-                        config.tools.web.search.max_results as usize,
-                    )))
-                    .await;
-                info!("Registered web_search tool");
-            }
+        let brave_key = config
+            .tools
+            .web
+            .search
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty());
+        let max = config.tools.web.search.max_results as usize;
+        if let Some(key) = brave_key {
+            agent
+                .register_tool(Box::new(WebSearchTool::with_max_results(key, max)))
+                .await;
+            info!("Registered web_search tool (Brave)");
+        } else {
+            agent
+                .register_tool(Box::new(DdgSearchTool::with_max_results(max)))
+                .await;
+            info!("Registered web_search tool (DuckDuckGo fallback)");
         }
     }
     if tool_enabled("web_fetch") {
@@ -721,6 +749,22 @@ Enable runtime.allow_fallback_to_native to opt in to native fallback.",
                 }
                 Err(e) => warn!("Failed to initialize google_sheets tool: {}", e),
             }
+        }
+    }
+
+    // Register Google Workspace tool (feature-gated).
+    #[cfg(feature = "google")]
+    if tool_enabled("google") {
+        let google_token = resolve_google_token(&config).await;
+        if let Some(token) = google_token {
+            agent
+                .register_tool(Box::new(GoogleTool::new(
+                    &token,
+                    &config.tools.google.default_calendar,
+                    config.tools.google.max_search_results,
+                )))
+                .await;
+            info!("Registered google tool");
         }
     }
 
@@ -960,6 +1004,23 @@ Enable runtime.allow_fallback_to_native to opt in to native fallback.",
             }
             Err(e) => warn!(error = %e, "Plugin discovery failed"),
         }
+    }
+
+    // Register create_tool management tool
+    if tool_enabled("create_tool") {
+        agent
+            .register_tool(Box::new(zeptoclaw::tools::composed::CreateToolTool::new()))
+            .await;
+    }
+
+    // Load and register user-defined composed tools
+    for tool in zeptoclaw::tools::composed::load_composed_tools() {
+        let name = tool.name().to_string();
+        if !tool_enabled(&name) {
+            continue;
+        }
+        agent.register_tool(tool).await;
+        info!(tool = %name, "Registered composed tool");
     }
 
     // Validate and register custom CLI-defined tools
@@ -1238,6 +1299,30 @@ pub(crate) fn friendly_api_error(provider: &str, status: u16, body: &str) -> Str
     } else {
         base
     }
+}
+
+/// Resolve Google access token: stored OAuth -> config fallback.
+#[cfg(feature = "google")]
+async fn resolve_google_token(config: &Config) -> Option<String> {
+    // 1. Try stored OAuth token
+    let token_path = Config::dir().join("tokens").join("google.json");
+    if let Ok(data) = tokio::fs::read_to_string(&token_path).await {
+        if let Ok(token_set) = serde_json::from_str::<zeptoclaw::auth::OAuthTokenSet>(&data) {
+            if !token_set.is_expired() {
+                return Some(token_set.access_token.clone());
+            }
+            tracing::warn!("Stored Google OAuth token expired, falling back to config");
+        }
+    }
+
+    // 2. Fall back to static access_token from config
+    config
+        .tools
+        .google
+        .access_token
+        .as_deref()
+        .filter(|t| !t.trim().is_empty())
+        .map(String::from)
 }
 
 #[cfg(test)]

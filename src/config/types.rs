@@ -614,9 +614,41 @@ pub struct ChannelsConfig {
     pub webhook: Option<WebhookConfig>,
     /// Email channel configuration (IMAP IDLE + SMTP). Feature-gated behind channel-email.
     pub email: Option<EmailConfig>,
+    /// Serial (UART) channel configuration. Requires `hardware` feature.
+    pub serial: Option<SerialChannelConfig>,
     /// Directory for channel plugins (default: ~/.zeptoclaw/channels/)
     #[serde(default)]
     pub channel_plugins_dir: Option<String>,
+}
+
+/// Serial (UART) channel configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SerialChannelConfig {
+    /// Whether the channel is enabled.
+    pub enabled: bool,
+    /// Serial port path (e.g., "/dev/ttyUSB0", "COM3").
+    pub port: String,
+    /// Baud rate (default: 115200).
+    pub baud_rate: u32,
+    /// Allow only specific sender IDs.
+    #[serde(default)]
+    pub allow_from: Vec<String>,
+    /// Deny all senders unless in allowlist.
+    #[serde(default)]
+    pub deny_by_default: bool,
+}
+
+impl Default for SerialChannelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: String::new(),
+            baud_rate: 115_200,
+            allow_from: Vec::new(),
+            deny_by_default: false,
+        }
+    }
 }
 
 /// Webhook inbound channel configuration
@@ -983,6 +1015,8 @@ pub struct ProvidersConfig {
     pub ollama: Option<ProviderConfig>,
     /// Nvidia NIM configuration
     pub nvidia: Option<ProviderConfig>,
+    /// ShengSuanYun configuration
+    pub shengsuanyun: Option<ProviderConfig>,
     /// Retry behavior for runtime provider calls
     pub retry: RetryConfig,
     /// Fallback behavior across multiple configured runtime providers
@@ -1006,6 +1040,10 @@ pub struct ProviderConfig {
     /// Authentication method: "api_key" (default), "oauth", or "auto"
     #[serde(default)]
     pub auth_method: Option<String>,
+    /// Per-provider model override. When set, this model is used instead of
+    /// `agents.defaults.model` when this provider is selected (e.g. in fallback chains).
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 impl ProviderConfig {
@@ -1053,6 +1091,8 @@ pub struct RetryConfig {
     pub base_delay_ms: u64,
     /// Maximum delay cap in milliseconds for exponential backoff.
     pub max_delay_ms: u64,
+    /// Total wall-clock retry budget in milliseconds. 0 = unlimited.
+    pub retry_budget_ms: u64,
 }
 
 impl Default for RetryConfig {
@@ -1062,6 +1102,7 @@ impl Default for RetryConfig {
             max_retries: 3,
             base_delay_ms: 1_000,
             max_delay_ms: 30_000,
+            retry_budget_ms: 45_000,
         }
     }
 }
@@ -1131,6 +1172,28 @@ pub struct RateLimitConfig {
     pub webhook_per_min: u32,
 }
 
+/// Startup guard configuration — degrade after consecutive crashes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StartupGuardConfig {
+    /// Enable startup guard (default: true).
+    pub enabled: bool,
+    /// Consecutive crashes before entering degraded mode (default: 4).
+    pub crash_threshold: u32,
+    /// Time window in seconds — crashes older than this are stale (default: 300).
+    pub window_secs: u64,
+}
+
+impl Default for StartupGuardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            crash_threshold: 4,
+            window_secs: 300,
+        }
+    }
+}
+
 /// Gateway server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1142,6 +1205,9 @@ pub struct GatewayConfig {
     /// Per-IP rate limiting for gateway endpoints.
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+    /// Startup guard — degrade after consecutive crashes.
+    #[serde(default)]
+    pub startup_guard: StartupGuardConfig,
 }
 
 impl Default for GatewayConfig {
@@ -1150,6 +1216,7 @@ impl Default for GatewayConfig {
             host: "0.0.0.0".to_string(),
             port: 8080,
             rate_limit: RateLimitConfig::default(),
+            startup_guard: StartupGuardConfig::default(),
         }
     }
 }
@@ -1186,6 +1253,9 @@ pub struct ToolsConfig {
     pub whatsapp: WhatsAppToolConfig,
     /// Google Sheets tool configuration
     pub google_sheets: GoogleSheetsToolConfig,
+    /// Google Workspace tool configuration (Gmail + Calendar)
+    #[serde(default)]
+    pub google: GoogleToolConfig,
     /// HTTP request tool configuration
     pub http_request: Option<HttpRequestConfig>,
     /// Voice transcription tool configuration
@@ -1194,6 +1264,9 @@ pub struct ToolsConfig {
     /// Skills marketplace (ClawHub) configuration
     #[serde(default)]
     pub skills: SkillsMarketplaceConfig,
+    /// Tools to deny (disable). Set by startup guard in degraded mode.
+    #[serde(default)]
+    pub deny: Vec<String>,
 }
 
 /// Configuration for the HTTP request tool.
@@ -1288,6 +1361,37 @@ pub struct GoogleSheetsToolConfig {
     /// Optional service account JSON encoded as base64
     #[serde(default)]
     pub service_account_base64: Option<String>,
+}
+
+/// Google Workspace tool configuration (Gmail + Calendar).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GoogleToolConfig {
+    /// OAuth bearer access token (fallback when no stored OAuth session)
+    #[serde(default)]
+    pub access_token: Option<String>,
+    /// Google OAuth client ID
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// Google OAuth client secret
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    /// Default calendar ID for calendar actions
+    pub default_calendar: String,
+    /// Maximum results for gmail_search
+    pub max_search_results: u32,
+}
+
+impl Default for GoogleToolConfig {
+    fn default() -> Self {
+        Self {
+            access_token: None,
+            client_id: None,
+            client_secret: None,
+            default_calendar: "primary".to_string(),
+            max_search_results: 20,
+        }
+    }
 }
 
 // ============================================================================
@@ -2271,6 +2375,56 @@ mod tests {
         assert!(cfg.landlock.fs_read_dirs.contains(&"/usr".to_string()));
         assert!(cfg.firejail.profile.is_none());
         assert!(cfg.bubblewrap.dev_bind);
+    }
+
+    #[test]
+    fn test_google_tool_config_default() {
+        let config = GoogleToolConfig::default();
+        assert!(config.access_token.is_none());
+        assert!(config.client_id.is_none());
+        assert!(config.client_secret.is_none());
+        assert_eq!(config.default_calendar, "primary");
+        assert_eq!(config.max_search_results, 20);
+    }
+
+    #[test]
+    fn test_google_tool_config_deserialize() {
+        let json = r#"{
+            "access_token": "ya29.test",
+            "client_id": "123.apps.googleusercontent.com",
+            "client_secret": "secret",
+            "default_calendar": "work",
+            "max_search_results": 50
+        }"#;
+        let config: GoogleToolConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.access_token.as_deref(), Some("ya29.test"));
+        assert_eq!(config.default_calendar, "work");
+        assert_eq!(config.max_search_results, 50);
+    }
+
+    #[test]
+    fn test_provider_config_model_default_is_none() {
+        let config = ProviderConfig::default();
+        assert!(config.model.is_none());
+    }
+
+    #[test]
+    fn test_provider_config_model_deserialize() {
+        let json = r#"{
+            "api_key": "sk-test",
+            "model": "gpt-4o"
+        }"#;
+        let config: ProviderConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.api_key.as_deref(), Some("sk-test"));
+        assert_eq!(config.model.as_deref(), Some("gpt-4o"));
+    }
+
+    #[test]
+    fn test_provider_config_model_absent() {
+        let json = r#"{"api_key": "sk-test"}"#;
+        let config: ProviderConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.api_key.as_deref(), Some("sk-test"));
+        assert!(config.model.is_none());
     }
 }
 

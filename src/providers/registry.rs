@@ -34,6 +34,8 @@ pub struct RuntimeProviderSelection {
     pub backend: &'static str,
     /// Resolved credential (OAuth token or API key).
     pub credential: ResolvedCredential,
+    /// Per-provider model override from config.
+    pub model: Option<String>,
 }
 
 /// Provider registry in priority order.
@@ -103,6 +105,13 @@ pub const PROVIDER_REGISTRY: &[ProviderSpec] = &[
         default_base_url: Some("https://integrate.api.nvidia.com/v1"),
         backend: "openai",
     },
+    ProviderSpec {
+        name: "shengsuanyun",
+        model_keywords: &["shengsuanyun"],
+        runtime_supported: true,
+        default_base_url: Some("https://router.shengsuanyun.com/api/v1"),
+        backend: "openai",
+    },
 ];
 
 pub fn provider_config_by_name<'a>(config: &'a Config, name: &str) -> Option<&'a ProviderConfig> {
@@ -116,6 +125,7 @@ pub fn provider_config_by_name<'a>(config: &'a Config, name: &str) -> Option<&'a
         "gemini" => config.providers.gemini.as_ref(),
         "ollama" => config.providers.ollama.as_ref(),
         "nvidia" => config.providers.nvidia.as_ref(),
+        "shengsuanyun" => config.providers.shengsuanyun.as_ref(),
         _ => None,
     }
 }
@@ -202,6 +212,7 @@ pub fn resolve_runtime_providers(config: &Config) -> Vec<RuntimeProviderSelectio
             api_base,
             backend: spec.backend,
             credential,
+            model: provider.and_then(|p| p.model.clone()),
         });
     }
 
@@ -465,6 +476,23 @@ mod tests {
     }
 
     #[test]
+    fn test_shengsuanyun_resolves_with_default_base_url() {
+        let mut config = Config::default();
+        config.providers.shengsuanyun = Some(ProviderConfig {
+            api_key: Some("shengsuanyun-test".to_string()),
+            ..Default::default()
+        });
+
+        let selected = resolve_runtime_provider(&config).expect("provider should resolve");
+        assert_eq!(selected.name, "shengsuanyun");
+        assert_eq!(selected.backend, "openai");
+        assert_eq!(
+            selected.api_base.as_deref(),
+            Some("https://router.shengsuanyun.com/api/v1")
+        );
+    }
+
+    #[test]
     fn test_openai_has_no_default_base_url() {
         let mut config = Config::default();
         config.providers.openai = Some(ProviderConfig {
@@ -539,5 +567,32 @@ mod tests {
 
         assert_eq!(api_key, "sk-ant-fallback");
         assert!(matches!(credential, ResolvedCredential::ApiKey(_)));
+    }
+
+    #[test]
+    fn test_runtime_selection_carries_provider_model() {
+        let mut config = Config::default();
+        config.providers.anthropic = Some(ProviderConfig {
+            api_key: Some("sk-test".to_string()),
+            model: Some("claude-opus-4-20250514".to_string()),
+            ..Default::default()
+        });
+
+        let resolved = resolve_runtime_providers(&config);
+        let anthropic = resolved.iter().find(|s| s.name == "anthropic").unwrap();
+        assert_eq!(anthropic.model, Some("claude-opus-4-20250514".to_string()));
+    }
+
+    #[test]
+    fn test_runtime_selection_model_none_when_not_configured() {
+        let mut config = Config::default();
+        config.providers.anthropic = Some(ProviderConfig {
+            api_key: Some("sk-test".to_string()),
+            ..Default::default()
+        });
+
+        let resolved = resolve_runtime_providers(&config);
+        let anthropic = resolved.iter().find(|s| s.name == "anthropic").unwrap();
+        assert_eq!(anthropic.model, None);
     }
 }

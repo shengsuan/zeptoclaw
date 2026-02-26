@@ -1,6 +1,6 @@
 [package]
 name = "zeptoclaw"
-version = "0.5.5"
+version = "0.6.0"
 edition = "2021"
 authors = ["ZeptoClaw Contributors"]
 description = "Ultra-lightweight personal AI assistant"
@@ -39,6 +39,12 @@ json5 = "0.4"
 # - rustls-tls: Pure Rust TLS implementation (smaller than native-tls)
 # - default-features = false: Excludes unnecessary features
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream", "multipart"], default-features = false }
+
+# =============================================================================
+# HTML PARSING
+# =============================================================================
+# DOM parser built on Servo's html5ever — CSS selectors for web_fetch extraction
+scraper = "0.25"
 
 # =============================================================================
 # CLI
@@ -127,11 +133,11 @@ lopdf = { version = "0.34", optional = true }
 # CHANNELS
 # =============================================================================
 # WebSocket support for future real-time channels
-tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 # Protobuf decoding for Lark/Feishu pbbp2 WS frames
 prost = "0.13"
 # Telegram bot SDK (minimal features to reduce bloat)
-teloxide = { version = "0.12", features = ["macros", "rustls"], default-features = false }
+teloxide = { version = "0.17", features = ["macros", "rustls"], default-features = false }
 # Integration helpers
 base64 = "0.22"
 # Temp directory creation for container env files
@@ -171,6 +177,14 @@ probe-rs = { version = "0.31", optional = true }
 # Fast XML parser for Android uiautomator dump parsing
 quick-xml = { version = "0.36", optional = true }
 
+# =============================================================================
+# GOOGLE WORKSPACE (optional, --features google)
+# =============================================================================
+gog-gmail    = { git = "https://github.com/qhkm/gogcli-rs", optional = true }
+gog-calendar = { git = "https://github.com/qhkm/gogcli-rs", optional = true }
+gog-auth     = { git = "https://github.com/qhkm/gogcli-rs", optional = true }
+gog-core     = { git = "https://github.com/qhkm/gogcli-rs", optional = true }
+
 # USB device enumeration — only on platforms nusb supports (Linux, macOS, Windows)
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
 nusb = { version = "0.2", default-features = false, optional = true }
@@ -199,6 +213,8 @@ channel-email = ["async-imap", "lettre", "mail-parser", "tokio-rustls", "rustls"
 hardware = ["nusb", "tokio-serial"]
 # Raspberry Pi GPIO peripheral (Linux only, requires rppal)
 peripheral-rpi = ["rppal"]
+# ESP32 peripheral (wraps serial transport with ESP32 board profile)
+peripheral-esp32 = ["hardware"]
 # Debug probe for STM32/Nucleo memory read via USB (adds ~50 deps)
 probe = ["probe-rs"]
 # Android device control tool via ADB (adds quick-xml for UI hierarchy parsing)
@@ -207,6 +223,8 @@ android = ["quick-xml"]
 sandbox-landlock   = ["dep:landlock"]
 sandbox-firejail   = []
 sandbox-bubblewrap = []
+# Google Workspace tools (Gmail + Calendar) via gogcli-rs
+google = ["dep:gog-gmail", "dep:gog-calendar", "dep:gog-auth", "dep:gog-core"]
 
 
 [dev-dependencies]
